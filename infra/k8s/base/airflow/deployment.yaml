@@ -132,7 +132,7 @@ spec:
                 name: mlflow-client-env
             # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY for the artifact store.
             - secretRef:
-                name: minio-credentials
+                name: rustfs-credentials
           env:
             # S5 training database identity, from the same Secret api-inference
             # uses (host/port are plain config in `airflow-env`).
@@ -202,7 +202,7 @@ spec:
             - configMapRef:
                 name: mlflow-client-env
             - secretRef:
-                name: minio-credentials
+                name: rustfs-credentials
           env:
             # S5 training database identity, from the same Secret api-inference
             # uses (host/port are plain config in `airflow-env`).
@@ -263,7 +263,7 @@ spec:
             - configMapRef:
                 name: mlflow-client-env
             - secretRef:
-                name: minio-credentials
+                name: rustfs-credentials
           env:
             # S5 training database identity, from the same Secret api-inference
             # uses (host/port are plain config in `airflow-env`).
@@ -322,7 +322,7 @@ spec:
             - configMapRef:
                 name: mlflow-client-env
             - secretRef:
-                name: minio-credentials
+                name: rustfs-credentials
           env:
             # S5 training database identity, from the same Secret api-inference
             # uses (host/port are plain config in `airflow-env`).

@@ -7,7 +7,7 @@
 # DAGs and the `scripts` package are baked into the image
 # (services/airflow/Dockerfile), so there is no ConfigMap for dags/config/plugins.
 # The metadata database lives in base/postgres-airflow; the training database
-# (postgres-train), MLflow and MinIO come from the other bases.
+# (postgres-train), MLflow and RustFS come from the other bases.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -22,8 +22,8 @@ resources:
 # deployment-specific values (TRAIN_DB_HOST/PORT, dataset path and URI, MLflow
 # experiment, model name and alias, REAL_ESTATE_TRAINING_SCHEDULE) are merged in
 # from .env by infra/k8s/generated. Secrets (`airflow-secrets`,
-# `airflow-admin-user`, `postgres-train-credentials`) and the MLflow/MinIO
-# client settings (`mlflow-client-env`, `minio-credentials`) come from .env too
+# `airflow-admin-user`, `postgres-train-credentials`) and the MLflow/RustFS
+# client settings (`mlflow-client-env`, `rustfs-credentials`) come from .env too
 # and are attached separately.
 configMapGenerator:
   - name: airflow-env

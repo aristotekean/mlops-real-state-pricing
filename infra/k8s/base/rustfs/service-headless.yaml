@@ -1,0 +1,20 @@
+# Headless Service required by the rustfs StatefulSet (spec.serviceName):
+# it gives the pod the stable DNS name rustfs-0.rustfs-headless. Clients
+# keep using the regular `rustfs` Service in service.yaml.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rustfs-headless
+  labels:
+    app.kubernetes.io/name: rustfs
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: rustfs
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: s3
+    - name: console
+      port: 9001
+      targetPort: console

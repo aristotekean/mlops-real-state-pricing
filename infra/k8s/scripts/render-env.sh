@@ -4,7 +4,7 @@
 # `components:`. The component holds:
 #
 #   - one env file + generator per ConfigMap / Secret the manifests reference
-#     (mlflow-client-env, minio-env, minio-credentials, postgres-train-credentials, ...);
+#     (mlflow-client-env, rustfs-credentials, postgres-train-credentials, ...);
 #   - the `images:` block, so DOCKERHUB_USER / IMAGE_TAG pick the image tags;
 #   - a merge of the .env values into the `airflow-env` ConfigMap, whose fixed
 #     Airflow settings stay in base/airflow/kustomization.yaml.
@@ -12,7 +12,7 @@
 # Why rendered: kustomize's load restrictions only let a generator read files
 # under its own root (infra/k8s), so it cannot read the root .env, and one
 # .env feeds several objects under other key names (POSTGRES_USER from
-# TRAIN_DB_USER, AWS_ACCESS_KEY_ID from MINIO_ROOT_USER, ...).
+# TRAIN_DB_USER, AWS_ACCESS_KEY_ID from RUSTFS_ACCESS_KEY, ...).
 #
 # The output contains credentials, so it is git-ignored. Re-run it after every
 # change to .env, then apply:
@@ -45,7 +45,7 @@ set +a
 
 REQUIRED="DOCKERHUB_USER IMAGE_TAG
 MLFLOW_DB_NAME MLFLOW_DB_USER MLFLOW_DB_PASSWORD
-MINIO_ROOT_USER MINIO_ROOT_PASSWORD MLFLOW_ARTIFACTS_BUCKET MINIO_PROMETHEUS_AUTH_TYPE
+RUSTFS_ACCESS_KEY RUSTFS_SECRET_KEY MLFLOW_ARTIFACTS_BUCKET
 MLFLOW_TRACKING_URI MLFLOW_S3_ENDPOINT_URL MLFLOW_EXPERIMENT_NAME
 MODEL_NAME MODEL_ALIAS MODEL_REFRESH_SECONDS
 TRAIN_DB_HOST TRAIN_DB_PORT TRAIN_DB_NAME TRAIN_DB_USER TRAIN_DB_PASSWORD
@@ -92,7 +92,6 @@ mkdir -p "$OUT"
 
 # ConfigMaps.
 write_env mlflow-client-env.env MLFLOW_TRACKING_URI MLFLOW_S3_ENDPOINT_URL
-write_env minio-env.env MINIO_PROMETHEUS_AUTH_TYPE
 write_env mlflow-server-env.env MLFLOW_ARTIFACTS_BUCKET MLFLOW_ALLOWED_HOSTS MLFLOW_CORS_ALLOWED_ORIGINS
 write_env api-inference-env.env MODEL_NAME MODEL_ALIAS MODEL_REFRESH_SECONDS TRAIN_DB_HOST TRAIN_DB_PORT
 write_env frontend-env.env API_URL
@@ -100,11 +99,11 @@ write_env airflow-env.env TRAIN_DB_HOST TRAIN_DB_PORT REAL_ESTATE_DATASET_PATH R
     MLFLOW_EXPERIMENT_NAME MODEL_NAME MODEL_ALIAS REAL_ESTATE_TRAINING_SCHEDULE
 
 # Secrets.
-write_pairs minio-credentials.env \
-    "MINIO_ROOT_USER=$MINIO_ROOT_USER" \
-    "MINIO_ROOT_PASSWORD=$MINIO_ROOT_PASSWORD" \
-    "AWS_ACCESS_KEY_ID=$MINIO_ROOT_USER" \
-    "AWS_SECRET_ACCESS_KEY=$MINIO_ROOT_PASSWORD"
+write_pairs rustfs-credentials.env \
+    "RUSTFS_ACCESS_KEY=$RUSTFS_ACCESS_KEY" \
+    "RUSTFS_SECRET_KEY=$RUSTFS_SECRET_KEY" \
+    "AWS_ACCESS_KEY_ID=$RUSTFS_ACCESS_KEY" \
+    "AWS_SECRET_ACCESS_KEY=$RUSTFS_SECRET_KEY"
 write_pairs mlflow-db-credentials.env \
     "POSTGRES_DB=$MLFLOW_DB_NAME" \
     "POSTGRES_USER=$MLFLOW_DB_USER" \
@@ -137,8 +136,6 @@ configMapGenerator:
     envs: [mlflow-client-env.env]
   - name: mlflow-server-env
     envs: [mlflow-server-env.env]
-  - name: minio-env
-    envs: [minio-env.env]
   - name: api-inference-env
     envs: [api-inference-env.env]
   - name: frontend-env
@@ -149,8 +146,8 @@ configMapGenerator:
     envs: [airflow-env.env]
 
 secretGenerator:
-  - name: minio-credentials
-    envs: [minio-credentials.env]
+  - name: rustfs-credentials
+    envs: [rustfs-credentials.env]
   - name: mlflow-db-credentials
     envs: [mlflow-db-credentials.env]
   - name: postgres-train-credentials

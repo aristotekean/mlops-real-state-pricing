@@ -1,45 +1,47 @@
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: minio
+  name: rustfs
   labels:
-    app.kubernetes.io/name: minio
+    app.kubernetes.io/name: rustfs
 spec:
   replicas: 1
-  # Single-node MinIO owns its data directory: a StatefulSet
-  # gives the pod a stable identity (minio-0), its own PVC from
+  # Single-node RustFS owns its data directory: a StatefulSet
+  # gives the pod a stable identity (rustfs-0), its own PVC from
   # volumeClaimTemplates below (kept across restarts and deletes) and an
   # update that terminates the old pod before creating the new one, so two
   # instances never write the same volume. The headless Service names
-  # the pod as minio-0.minio-headless; clients keep using
-  # `minio`.
-  serviceName: minio-headless
+  # the pod as rustfs-0.rustfs-headless; clients keep using
+  # `rustfs`.
+  serviceName: rustfs-headless
   selector:
     matchLabels:
-      app.kubernetes.io/name: minio
+      app.kubernetes.io/name: rustfs
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: minio
+        app.kubernetes.io/name: rustfs
     spec:
-      # The image runs as the unprivileged `nonroot` user (65532). fsGroup
+      # The image runs as the unprivileged `rustfs` user (10001). fsGroup
       # makes the freshly provisioned volume writable by that user.
       securityContext:
-        runAsUser: 65532
-        runAsGroup: 65532
-        fsGroup: 65532
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
       containers:
-        - name: minio
-          image: cgr.dev/chainguard/minio:latest
-          args: ["server", "/data", "--console-address", ":9001"]
+        - name: rustfs
+          image: rustfs/rustfs:1.0.6
+          # No args: the image entrypoint starts `rustfs` on RUSTFS_VOLUMES
+          # (/data), S3 on :9000 and the console on :9001.
           envFrom:
+            # RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY, from .env.
             - secretRef:
-                name: minio-credentials
-            # MINIO_PROMETHEUS_AUTH_TYPE from .env (infra/k8s/generated), as in
-            # docker-compose.yml: `public` lets Prometheus (Server C) scrape
-            # /minio/v2/metrics/cluster without a bearer token.
-            - configMapRef:
-                name: minio-env
+                name: rustfs-credentials
+          env:
+            # The image defaults to log files under /logs; empty sends the
+            # logs to stdout so `kubectl logs` shows them.
+            - name: RUSTFS_OBS_LOG_DIRECTORY
+              value: ""
           ports:
             - name: s3
               containerPort: 9000
@@ -48,7 +50,7 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
-          # Single-node store for MLflow artifacts; the 1Gi ceiling covers MinIO's
+          # Single-node store for MLflow artifacts; the 1Gi ceiling covers RustFS's
           # own caches on this stack's volumes.
           resources:
             requests:
@@ -57,26 +59,26 @@ spec:
             limits:
               cpu: 500m
               memory: 1Gi
-          # compose uses `mc ready local`; here the unauthenticated health
-          # endpoints are used so the kubelet probes over HTTP (no exec
-          # needed). /ready answers 200 only once the server can serve
-          # requests, /live only says the process is up.
+          # Unauthenticated health endpoints, probed by the kubelet over HTTP
+          # (compose curls the same /health/ready). /ready answers 200 only
+          # once the server can serve requests, /live only says the process
+          # is up.
           readinessProbe:
             httpGet:
-              path: /minio/health/ready
+              path: /health/ready
               port: s3
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5
           livenessProbe:
             httpGet:
-              path: /minio/health/live
+              path: /health/live
               port: s3
             initialDelaySeconds: 30
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 10
-  # One PVC per pod, named data-minio-0; no storageClassName: the
+  # One PVC per pod, named data-rustfs-0; no storageClassName: the
   # cluster default is used (OrbStack: `local-path`, bound when the pod is
   # scheduled). The PVC outlives the pod and the StatefulSet.
   volumeClaimTemplates:

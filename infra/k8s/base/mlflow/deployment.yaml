@@ -1,5 +1,5 @@
 # Official MLflow image. It ships MLflow only, so the two client libraries the
-# server needs (psycopg2 for Postgres, boto3 for S3/MinIO) are installed at
+# server needs (psycopg2 for Postgres, boto3 for S3/RustFS) are installed at
 # container start instead of baking a custom image. This needs network access
 # on every start and adds ~30-90 s before the server is up (covered by the
 # startupProbe). Both versions are pinned to keep starts reproducible.
@@ -61,36 +61,36 @@ spec:
             limits:
               cpu: 100m
               memory: 64Mi
-        - name: wait-for-minio-bucket
-          image: cgr.dev/chainguard/minio:latest
+        - name: wait-for-rustfs-bucket
+          image: rustfs/rustfs:1.0.6
           command: ["/bin/sh", "-c"]
           args:
             - |
               set -eu
-              # 100 x 3 s = 5 minutes: covers MinIO's own start plus the
-              # minio-init Job. mc's errors stay on stderr so the reason for
+              # 100 x 3 s = 5 minutes: covers RustFS's own start plus the
+              # rustfs-init Job. rc's errors stay on stderr so the reason for
               # waiting (server down vs. bucket missing) is visible in the logs.
               attempt=0
-              until mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null \
-                && mc ls "local/$MLFLOW_ARTIFACTS_BUCKET" >/dev/null; do
+              until rc alias set local http://rustfs:9000 "$RUSTFS_ACCESS_KEY" "$RUSTFS_SECRET_KEY" >/dev/null \
+                && rc object list "local/$MLFLOW_ARTIFACTS_BUCKET" >/dev/null; do
                 attempt=$((attempt + 1))
                 if [ "$attempt" -ge 100 ]; then
-                  echo "bucket $MLFLOW_ARTIFACTS_BUCKET not available after $attempt attempts (job/minio-init), giving up" >&2
+                  echo "bucket $MLFLOW_ARTIFACTS_BUCKET not available after $attempt attempts (job/rustfs-init), giving up" >&2
                   exit 1
                 fi
-                echo "waiting for minio bucket $MLFLOW_ARTIFACTS_BUCKET, created by job/minio-init ($attempt/100)..."
+                echo "waiting for rustfs bucket $MLFLOW_ARTIFACTS_BUCKET, created by job/rustfs-init ($attempt/100)..."
                 sleep 3
               done
           envFrom:
             - secretRef:
-                name: minio-credentials
+                name: rustfs-credentials
             # MLFLOW_ARTIFACTS_BUCKET.
             - configMapRef:
                 name: mlflow-server-env
           securityContext:
-            runAsUser: 65532
-            runAsGroup: 65532
-          # mc only: small, bounded.
+            runAsUser: 10001
+            runAsGroup: 10001
+          # rc only: small, bounded.
           resources:
             requests:
               cpu: 25m
@@ -171,7 +171,7 @@ spec:
                 name: mlflow-client-env
             # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY for boto3.
             - secretRef:
-                name: minio-credentials
+                name: rustfs-credentials
             # MLFLOW_ARTIFACTS_BUCKET plus the optional MLFLOW_ALLOWED_HOSTS and
             # MLFLOW_CORS_ALLOWED_ORIGINS from .env (empty by default; the
             # shell adds the leading comma only when a value is non-empty).

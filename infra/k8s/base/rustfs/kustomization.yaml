@@ -1,0 +1,15 @@
+# S3 · RustFS, the artifact store behind the MLflow server, plus the one-shot
+# Job that creates the `mlflow` bucket (RustFS does not create buckets on start
+# by default).
+#
+# Official RustFS image (Apache 2.0): runs as uid 10001 and ships the `rustfs`
+# server and the `rc` client (mc-style commands), hence the `rc`-based wait in
+# job-init.yaml. The probes in statefulset.yaml are kubelet-side httpGet.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - statefulset.yaml
+  - service.yaml
+  - service-headless.yaml
+  - job-init.yaml

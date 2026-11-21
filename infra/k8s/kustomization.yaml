@@ -10,8 +10,7 @@
 # Everything lands in the `real_estate` namespace. Project images are named
 # without a tag in the manifests; generated/ rewrites them to
 # DOCKERHUB_USER/<image>:IMAGE_TAG from .env. Third-party images follow docker-compose.yml: postgres and mlflow are pinned
-# in their own manifests; MinIO deliberately tracks
-# `cgr.dev/chainguard/minio:latest` (pinning it is out of scope for now).
+# in their own manifests, and so is RustFS (`rustfs/rustfs`).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -28,7 +27,7 @@ labels:
 resources:
   - base/config
   - base/postgres-mlflow
-  - base/minio
+  - base/rustfs
   - base/mlflow
   - base/postgres-train
   - base/api-inference

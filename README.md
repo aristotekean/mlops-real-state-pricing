@@ -2,7 +2,7 @@
 
 **Grupo 6:** Kevin Bueno · Juan Camilo Martínez · Jorge Andrés Gil
 
-Plataforma MLOps de extremo a extremo para predecir el riesgo de readmisión hospitalaria en pacientes con diabetes (dataset Diabetes 130-US hospitals, clases `NO`, `>30` y `<30`). Airflow carga los datos por lotes en PostgreSQL, entrena tres candidatos y registra el mejor en MLflow con el alias `production`; los artefactos viven en MinIO, una API FastAPI sirve `models:/real_estate@production` en `POST /predict` y un frontend Streamlit lo consulta. Todo Server A corre en Kubernetes (OrbStack) con autoescalado de la API; Locust (Server B) genera carga y Prometheus + Grafana (Server C) la observan.
+Plataforma MLOps de extremo a extremo para predecir el riesgo de readmisión hospitalaria en pacientes con diabetes (dataset Diabetes 130-US hospitals, clases `NO`, `>30` y `<30`). Airflow carga los datos por lotes en PostgreSQL, entrena tres candidatos y registra el mejor en MLflow con el alias `production`; los artefactos viven en RustFS, una API FastAPI sirve `models:/real_estate@production` en `POST /predict` y un frontend Streamlit lo consulta. Todo Server A corre en Kubernetes (OrbStack) con autoescalado de la API; Locust (Server B) genera carga y Prometheus + Grafana (Server C) la observan.
 
 ## Ruta rápida
 
@@ -59,7 +59,7 @@ flowchart LR
         s5[("S5 postgres-train<br/>raw · clean · inference")] -->|lotes| s6["S6 Airflow<br/>DAG incremental"]
         s6 -->|runs y modelo| s2["S2 MLflow<br/>tracking + registry"]
         s2 <-->|metadatos| s1[("S1 mlflow-db")]
-        s2 <-->|artefactos| s3[("S3 MinIO<br/>bucket mlflow")]
+        s2 <-->|artefactos| s3[("S3 RustFS<br/>bucket mlflow")]
         s4["S4 api-inference<br/>FastAPI + HPA"] -->|"models:/real_estate@production"| s2
         s4 -->|inference.logs| s5
         s7["S7 frontend<br/>Streamlit"] -->|/predict| s4
@@ -75,8 +75,8 @@ Los tres servidores se conectan por una red Tailscale. En OrbStack todo Server A
 | Servicio | URL | Credenciales | Rol |
 |----------|-----|--------------|-----|
 | `mlflow-db` (S1) | solo red interna | `mlflow` / `mlflow` | Backend store de MLflow |
-| `mlflow` (S2) | <http://mlflow.k8s.orb.local> | sin autenticación | Tracking server y Model Registry; sirve los artefactos por proxy hacia MinIO |
-| `minio` (S3) | consola `http://minio.real-estate.svc.cluster.local:9001` | `minioadmin` / `minioadmin` | Almacén de artefactos, bucket `mlflow` (lo crea el Job `minio-init`) |
+| `mlflow` (S2) | <http://mlflow.k8s.orb.local> | sin autenticación | Tracking server y Model Registry; sirve los artefactos por proxy hacia RustFS |
+| `rustfs` (S3) | consola `http://rustfs.real-estate.svc.cluster.local:9001/rustfs/console/` | `RUSTFS_ACCESS_KEY` / `RUSTFS_SECRET_KEY` de `.env` | Almacén de artefactos, bucket `mlflow` (lo crea el Job `rustfs-init`) |
 | `api-inference` (S4) | <http://api.k8s.orb.local> | sin autenticación | Sirve `models:/real_estate@production`; HPA de 1 a 20 pods al 70 % de CPU |
 | `postgres-train` (S5) | solo red interna | `app` / `app`, base `real_estate` | Esquemas `raw`, `clean` e `inference` (migraciones por el Job `train-db-migrate`) |
 | `airflow` (S6) | <http://airflow.k8s.orb.local> | `airflow` / `airflow` | api-server, scheduler, dag-processor y triggerer en un pod; metadatos en `airflow-db` |
@@ -103,31 +103,31 @@ flowchart TB
         af --> svcpt
         af --> svcafdb["svc airflow-db"] --> afdb[("StatefulSet airflow-db<br/>PVC data-airflow-db-0 · 2Gi")]
         ml --> svcmldb["svc mlflow-db"] --> mldb[("StatefulSet mlflow-db<br/>PVC data-mlflow-db-0 · 2Gi")]
-        ml --> svcminio["svc minio"] --> minio[("StatefulSet minio<br/>PVC data-minio-0 · 5Gi")]
+        ml --> svcrustfs["svc rustfs"] --> rustfs[("StatefulSet rustfs<br/>PVC data-rustfs-0 · 5Gi")]
         api & af -->|"models:/ · runs"| svcml
         af --- pvcaf[("PVC airflow-dataset · 1Gi")]
 
         jmig["Job train-db-migrate<br/>ConfigMap train-db-migrations"] --> svcpt
-        jminio["Job minio-init<br/>bucket mlflow"] --> svcminio
+        jrustfs["Job rustfs-init<br/>bucket mlflow"] --> svcrustfs
         jaf["Job airflow-init<br/>migraciones + admin"] --> svcafdb
     end
 
-    gen -.->|envFrom| fe & api & ml & af & pt & afdb & mldb & minio
+    gen -.->|envFrom| fe & api & ml & af & pt & afdb & mldb & rustfs
     hub[("Docker Hub<br/>aristotekean/real-estate-*")] -.->|pull| fe & api & af
 ```
 
-Las bases de datos y MinIO son `StatefulSet` con una réplica: el pod tiene identidad estable (`postgres-train-0`), su PVC sale de `volumeClaimTemplates` y sobrevive al pod, y una actualización termina el pod viejo antes de crear el nuevo, así nunca hay dos instancias escribiendo el mismo volumen. Cada uno tiene además un Service headless (`<nombre>-headless`) que exige el StatefulSet; los clientes siguen usando el Service normal. Los componentes sin estado son `Deployment`; la API escala con un HPA y su spool de logs de inferencia vive en un `emptyDir` para poder correr varias réplicas.
+Las bases de datos y RustFS son `StatefulSet` con una réplica: el pod tiene identidad estable (`postgres-train-0`), su PVC sale de `volumeClaimTemplates` y sobrevive al pod, y una actualización termina el pod viejo antes de crear el nuevo, así nunca hay dos instancias escribiendo el mismo volumen. Cada uno tiene además un Service headless (`<nombre>-headless`) que exige el StatefulSet; los clientes siguen usando el Service normal. Los componentes sin estado son `Deployment`; la API escala con un HPA y su spool de logs de inferencia vive en un `emptyDir` para poder correr varias réplicas.
 
 | Componente | Workload | ConfigMap | Secret | Persistencia | Probes | requests → limits |
 |------------|----------|-----------|--------|--------------|--------|-------------------|
 | `mlflow-db` | StatefulSet | `mlflow-db-env` | `mlflow-db-credentials` | `data-mlflow-db-0` (2Gi) | readiness, liveness (`pg_isready`) | 100m/256Mi → 500m/512Mi |
 | `airflow-db` | StatefulSet | `airflow-db-env` | `airflow-db-credentials` | `data-airflow-db-0` (2Gi) | readiness, liveness (`pg_isready`) | 100m/256Mi → 500m/512Mi |
 | `postgres-train` | StatefulSet + Job `train-db-migrate` | `postgres-train-env`, `train-db-migrations` | `postgres-train-credentials` | `data-postgres-train-0` (2Gi) | readiness, liveness (`pg_isready`) | 100m/256Mi → 500m/512Mi |
-| `minio` | StatefulSet + Job `minio-init` | `minio-env` | `minio-credentials` | `data-minio-0` (5Gi) | readiness, liveness (`/minio/health/*`) | 100m/256Mi → 500m/1Gi |
-| `mlflow` | Deployment | `mlflow-server-env`, `mlflow-client-env` | `mlflow-db-credentials`, `minio-credentials` | sin estado (Postgres + MinIO) | startup, readiness, liveness (`/health`) | 250m/512Mi → 1/2Gi |
-| `api-inference` | Deployment + HPA | `api-inference-env`, `mlflow-client-env` | `postgres-train-credentials`, `minio-credentials` | `emptyDir` spool (256Mi) | startup, readiness, liveness (`/health`) | 250m/512Mi → 1/1Gi |
+| `rustfs` | StatefulSet + Job `rustfs-init` | — | `rustfs-credentials` | `data-rustfs-0` (5Gi) | readiness, liveness (`/health/*`) | 100m/256Mi → 500m/1Gi |
+| `mlflow` | Deployment | `mlflow-server-env`, `mlflow-client-env` | `mlflow-db-credentials`, `rustfs-credentials` | sin estado (Postgres + RustFS) | startup, readiness, liveness (`/health`) | 250m/512Mi → 1/2Gi |
+| `api-inference` | Deployment + HPA | `api-inference-env`, `mlflow-client-env` | `postgres-train-credentials`, `rustfs-credentials` | `emptyDir` spool (256Mi) | startup, readiness, liveness (`/health`) | 250m/512Mi → 1/1Gi |
 | `frontend` | Deployment | `frontend-env` | ninguno (no maneja credenciales) | sin estado | startup, readiness, liveness | 100m/256Mi → 500m/512Mi |
-| `airflow` | Deployment + Job `airflow-init` | `airflow-env`, `mlflow-client-env` | `airflow-secrets`, `airflow-db-credentials`, `airflow-admin-user`, `minio-credentials`, `postgres-train-credentials` | `airflow-dataset` (1Gi) | api-server: startup, readiness, liveness; scheduler, dag-processor y triggerer: liveness | api-server 250m/512Mi → 500m/1Gi · scheduler 500m/1Gi → 1/2Gi · dag-processor 150m/256Mi → 250m/768Mi · triggerer 100m/256Mi → 250m/768Mi |
+| `airflow` | Deployment + Job `airflow-init` | `airflow-env`, `mlflow-client-env` | `airflow-secrets`, `airflow-db-credentials`, `airflow-admin-user`, `rustfs-credentials`, `postgres-train-credentials` | `airflow-dataset` (1Gi) | api-server: startup, readiness, liveness; scheduler, dag-processor y triggerer: liveness | api-server 250m/512Mi → 500m/1Gi · scheduler 500m/1Gi → 1/2Gi · dag-processor 150m/256Mi → 250m/768Mi · triggerer 100m/256Mi → 250m/768Mi |
 
 Los init containers de espera (`pg_isready`, `mc`) y los Jobs también declaran `requests` y `limits`; `bash infra/k8s/scripts/check.sh` renderiza `.env` y valida que el kustomize construya antes de commitear.
 
@@ -150,7 +150,7 @@ sequenceDiagram
     participant AF as Airflow
     participant P as postgres-train
     participant M as MLflow
-    participant S as MinIO
+    participant S as RustFS
     participant A as api-inference
 
     AF->>P: ingest_next_batch (hasta 15.000 filas a raw.records)
@@ -223,7 +223,8 @@ python3 -m venv .venv && .venv/bin/pip install -e ./ml/real_estate_model pytest 
 | Prueba de carga | `LOCUST_HOST=http://api.k8s.orb.local docker compose --profile loadtest up -d` y abrir `localhost:8089`; `LOCUST_STEP_LOAD=1` busca el punto de degradación por escalones |
 | Observar el autoescalado | `kubectl -n real-estate get hpa api-inference -w` muestra CPU y réplicas en vivo; añade hasta 2 pods cada 30 s y quita 1 por minuto tras 2 minutos de calma |
 | Monitoreo | `docker compose up -d prometheus grafana` levanta solo Prometheus y Grafana (`--profile monitoring up -d` los suma al stack completo); apuntar `prometheus/targets/api-targets.yml` a la API y `prometheus/targets/minio-targets.yml` a MinIO. Grafana abre en el dashboard **Real Estate · Inference API** (tráfico HTTP, latencias, errores, CPU/memoria del pod, MLOps y MinIO) |
-| Actualizar un clúster desplegado con los `Deployment` anteriores de las bases y MinIO | Los `StatefulSet` crean PVC nuevos (`data-<nombre>-0`), así que los datos no migran solos. Tras `kubectl apply -k infra/k8s`, borrar los workloads viejos para que el Service no reparta tráfico entre ambos: `kubectl -n real-estate delete deployment mlflow-db airflow-db postgres-train minio`; los PVC viejos (`mlflow-db-data`, `airflow-db-data`, `postgres-train-data`, `minio-data`) quedan hasta borrarlos a mano. El DAG regenera datos y modelo en la primera corrida |
+| Actualizar un clúster desplegado con los `Deployment` anteriores de las bases | Los `StatefulSet` crean PVC nuevos (`data-<nombre>-0`), así que los datos no migran solos. Tras `kubectl apply -k infra/k8s`, borrar los workloads viejos para que el Service no reparta tráfico entre ambos: `kubectl -n real-estate delete deployment mlflow-db airflow-db postgres-train`; los PVC viejos (`mlflow-db-data`, `airflow-db-data`, `postgres-train-data`) quedan hasta borrarlos a mano. El DAG regenera datos y modelo en la primera corrida |
+| Actualizar un clúster desplegado con MinIO | `kubectl apply -k infra/k8s` crea `rustfs` con un PVC vacío (`data-rustfs-0`) pero no borra lo anterior. Borrar los objetos viejos: `kubectl -n real-estate delete statefulset/minio service/minio service/minio-headless job/minio-init --ignore-not-found`; el PVC `data-minio-0` queda hasta borrarlo a mano. Los artefactos no migran solos: el DAG regenera el modelo en la primera corrida |
 | Borrar todo | `kubectl delete -k infra/k8s` (los PVC y sus datos se van con el namespace) |
 
 Locust y el monitoreo están detrás de los perfiles `loadtest` y `monitoring` del compose raíz, así que `docker compose up -d` no los arranca. Para el monitoreo:
@@ -235,7 +236,7 @@ docker compose --profile monitoring up -d      # stack completo + monitoreo
 
 Prometheus en <http://localhost:9090> y Grafana en <http://localhost:3000> (`admin` / `admin`). Si se levanta desde `infra/monitoring` o `infra/load-testing` por separado (Server C o Server B), el `--profile` también es obligatorio: sin él compose no arranca ningún servicio.
 
-> Los Secrets llevan las credenciales de desarrollo de compose (`minioadmin`, `airflow`, `app`, `mlflow`). Son para un clúster local; cámbialas antes de exponerlo a otras máquinas.
+> Los Secrets llevan las credenciales de desarrollo de `.env` (RustFS, `airflow`, `app`, `mlflow`). Son para un clúster local; cámbialas antes de exponerlo a otras máquinas.
 
 ## Solución de problemas
 

@@ -125,7 +125,7 @@ spec:
                 name: mlflow-client-env
             # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY for artifact download.
             - secretRef:
-                name: minio-credentials
+                name: rustfs-credentials
             # MODEL_NAME / MODEL_ALIAS (resolved as models:/<name>@<alias>),
             # MODEL_REFRESH_SECONDS (background poll of the alias, 0 disables
             # it) and TRAIN_DB_HOST / TRAIN_DB_PORT, from .env.

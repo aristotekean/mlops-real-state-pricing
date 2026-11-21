@@ -1,6 +1,6 @@
-# One-shot: create the MLflow artifact bucket. Reuses the MinIO image because
-# it ships `mc`. There is no `depends_on` in Kubernetes, so the script retries
-# `mc alias set` (which probes the server) until MinIO answers, then creates
+# One-shot: create the MLflow artifact bucket. Reuses the RustFS image because
+# it ships `rc`. There is no `depends_on` in Kubernetes, so the script retries
+# `rc alias set` (which probes the server) until RustFS answers, then creates
 # the bucket idempotently. Re-running the Job on an existing bucket is a no-op.
 #
 # A Job's pod template is immutable once created. Finished Jobs are
@@ -10,9 +10,9 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: minio-init
+  name: rustfs-init
   labels:
-    app.kubernetes.io/name: minio-init
+    app.kubernetes.io/name: rustfs-init
 spec:
   # Bounded on both axes: at most 6 retries of the pod, and the whole Job is
   # killed and marked Failed after 10 minutes regardless of retries. The
@@ -25,40 +25,40 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: minio-init
+        app.kubernetes.io/name: rustfs-init
     spec:
       restartPolicy: OnFailure
       securityContext:
-        runAsUser: 65532
-        runAsGroup: 65532
+        runAsUser: 10001
+        runAsGroup: 10001
       containers:
-        - name: mc
-          image: cgr.dev/chainguard/minio:latest
+        - name: rc
+          image: rustfs/rustfs:1.0.6
           command: ["/bin/sh", "-c"]
           args:
             - |
               set -eu
-              # Bounded wait: 40 x 3 s = 2 minutes. mc's own errors stay on
+              # Bounded wait: 40 x 3 s = 2 minutes. rc's own errors stay on
               # stderr so the reason for waiting is visible in the Job logs.
               attempt=0
-              until mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null; do
+              until rc alias set local http://rustfs:9000 "$RUSTFS_ACCESS_KEY" "$RUSTFS_SECRET_KEY" >/dev/null; do
                 attempt=$((attempt + 1))
                 if [ "$attempt" -ge 40 ]; then
-                  echo "minio not reachable at http://minio:9000 after $attempt attempts, giving up" >&2
+                  echo "rustfs not reachable at http://rustfs:9000 after $attempt attempts, giving up" >&2
                   exit 1
                 fi
-                echo "waiting for minio ($attempt/40)..."
+                echo "waiting for rustfs ($attempt/40)..."
                 sleep 3
               done
-              mc mb --ignore-existing "local/$MLFLOW_ARTIFACTS_BUCKET"
+              rc bucket create --ignore-existing "local/$MLFLOW_ARTIFACTS_BUCKET"
               echo "bucket ready: $MLFLOW_ARTIFACTS_BUCKET"
           envFrom:
             - secretRef:
-                name: minio-credentials
+                name: rustfs-credentials
             # MLFLOW_ARTIFACTS_BUCKET, from .env.
             - configMapRef:
                 name: mlflow-server-env
-          # mc only: small, bounded.
+          # rc only: small, bounded.
           resources:
             requests:
               cpu: 25m
