@@ -1,0 +1,21 @@
+# S1 · PostgreSQL backend store for MLflow. Reached as `mlflow-db` (same
+# hostname as in docker-compose.yml); internal to the stack, own volume.
+#
+# Credentials: Secret `mlflow-db-credentials`, rendered from MLFLOW_DB_* in
+# .env by infra/k8s/scripts/render-env.sh.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - statefulset.yaml
+  - service.yaml
+  - service-headless.yaml
+
+# Non-sensitive configuration of the database container (the credentials
+# stay in the Secret above). initdb refuses a non-empty directory and some
+# provisioners drop a `lost+found` at the mount root, so the cluster lives one
+# level below the mount point.
+configMapGenerator:
+  - name: mlflow-db-env
+    literals:
+      - PGDATA=/var/lib/postgresql/data/pgdata

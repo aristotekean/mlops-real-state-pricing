@@ -1,0 +1,32 @@
+# Real Estate MLOps · overlay de integración (monitoreo ⇄ API en la misma máquina)
+#
+# Conecta Prometheus a la red del stack de la API (el compose raíz usa
+# `name: real_estate`, así que su red por defecto es `real_estate_default`). Con esto
+# Prometheus resuelve y scrapea `api-inference:8000/metrics` y
+# `minio:9000/minio/v2/metrics/cluster` sin tocar el compose raíz (que es de
+# otro componente).
+#
+# Requisito: el stack de la API debe estar arriba primero (crea la red):
+#   docker compose up -d                     # desde la raíz del repo (API, MLflow, ...)
+#
+# Luego el monitoreo conectado a esa red:
+#   cd infra/monitoring
+#   docker compose -f docker-compose.yml -f docker-compose.integration.yml --profile monitoring up -d
+#
+# Sin este overlay, `docker compose -f docker-compose.yml --profile monitoring up -d`
+# sigue funcionando de forma independiente (el target de la API aparece DOWN
+# hasta conectarlo). Desde la raíz del repo no hace falta el overlay:
+# `docker compose up -d prometheus grafana` ya comparte la red con la API.
+
+networks:
+  # Red del stack de la API, creada por el compose raíz. `external: true` =
+  # no la crea este compose, se une a la ya existente.
+  real_estate:
+    external: true
+    name: real_estate_default
+
+services:
+  prometheus:
+    networks:
+      - default    # su propia red (Grafana ⇄ Prometheus)
+      - real_estate   # red de la API (alcanza api-inference:8000 y minio:9000)

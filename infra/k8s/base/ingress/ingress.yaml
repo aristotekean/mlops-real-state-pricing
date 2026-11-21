@@ -1,0 +1,93 @@
+# Host-based routing to the four HTTP services of Server A.
+#
+# One Ingress object holds all hosts: they share the same controller, the same
+# annotations and ship as one unit, so a reviewer sees the whole routing table
+# in one place and `kubectl -n real_estate get ingress` shows a single row.
+#
+# Hosts use OrbStack's wildcard domain: every `*.k8s.orb.local` name resolves
+# on the Mac to the cluster's LoadBalancer, so no /etc/hosts entries are
+# needed. On a Linux server replace them with the Tailscale name (or IP) of
+# the node, e.g. `mlflow.<node>.<tailnet>.ts.net`, and extend the MLflow
+# allow-lists through MLFLOW_ALLOWED_HOSTS and MLFLOW_CORS_ALLOWED_ORIGINS in
+# base/mlflow/deployment.yaml; `--allowed-hosts` and `--cors-allowed-origins`
+# already cover `*.orb.local`, nothing else.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: real_estate
+  labels:
+    app.kubernetes.io/name: ingress
+  annotations:
+    # Streamlit keeps a websocket open for the whole session and Airflow /
+    # MLflow pages poll for minutes: do not let nginx cut idle upstreams at
+    # its 60 s default. ingress-nginx forwards the Upgrade/Connection headers
+    # on its own, so no extra websocket annotation is needed.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # MLflow clients upload model artifacts (skops files, confusion matrices,
+    # reports) through the tracking server when they proxy artifacts; the
+    # default 1m body limit would reject them with 413. "0" disables the
+    # limit, which is acceptable behind a private Tailscale/OrbStack entry.
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: frontend.k8s.orb.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  name: http
+    - host: api.k8s.orb.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-inference
+                port:
+                  name: http
+    # Same API under the Mac's Tailscale MagicDNS name, for load tests run
+    # from another machine of the tailnet (infra/load-testing). OrbStack
+    # publishes the Ingress LoadBalancer on the Mac's localhost:80 only with
+    # `orb config set k8s.expose_services true` (a Kubernetes reset turns it
+    # off; `orb stop` + `orb start` applies it), and the Mac then forwards
+    # that port to the tailnet as raw TCP, so the Host header reaches nginx:
+    # `tailscale serve --bg --tcp=80 tcp://127.0.0.1:80`. Targeting the
+    # LoadBalancer IP (192.168.139.x) from tailscale serve does not work:
+    # tailscaled has no route into OrbStack's virtual network.
+    - host: kevins-macbook-pro.tail6eea58.ts.net
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-inference
+                port:
+                  name: http
+    - host: mlflow.k8s.orb.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: mlflow
+                port:
+                  name: http
+    - host: airflow.k8s.orb.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: airflow-apiserver
+                port:
+                  name: http

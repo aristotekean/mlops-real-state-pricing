@@ -221,3 +221,43 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Project specific ---
+
+# ML artifacts
+mlruns/
+mlartifacts/
+*.pkl
+*.joblib
+/data/RealEstate/RealEstate.csv
+
+# Locust results
+infra/load-testing/results/
+
+# Airflow local runtime
+services/airflow/logs/
+airflow.db
+airflow.cfg
+webserver_config.py
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Tooling
+.atl/
+
+# ODD feature documents (local working notes)
+odd/
+
+# api-inference on-disk spool (inference.logs rows written while Postgres is down)
+services/api-inference/spool/
+
+# Kubernetes configuration rendered from .env (holds credentials)
+infra/k8s/generated/

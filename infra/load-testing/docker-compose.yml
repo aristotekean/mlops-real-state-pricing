@@ -1,0 +1,70 @@
+# Real Estate MLOps · Locust load generator (Server B)
+#
+# Included by the root docker-compose.yml under the `loadtest` profile, so a
+# plain `docker compose up` never starts it. Paths are relative to this file.
+#
+# Local, against the API of the same compose network (from the repository root):
+#   docker compose --profile loadtest up -d
+#   UI on http://localhost:8089, target defaults to http://api-inference:8000
+#
+# On Server B, standalone (the API stack lives on Server A; this never starts it,
+# so the CPU spent simulating users does not compete with the API). The profile
+# is required here too, otherwise compose starts nothing:
+#   LOCUST_HOST=http://<SERVER_A>:<PORT> docker compose --env-file ../../.env -f docker-compose.yml --profile loadtest up -d
+#
+# Headless, same parameters for every run. The master coordinates the workers
+# (--expect-workers), so the traffic comes from LOCUST_WORKERS processes.
+# -u users, -r spawn rate, -t duration; --csv writes the stats to ./results.
+#   mkdir -p results     # create it first: Docker would create it as root
+#   LOCUST_HOST=http://<SERVER_A>:<PORT> \
+#   LOCUST_ARGS="--headless -u 50 -r 5 -t 3m --csv /mnt/results/u50" \
+#   docker compose --profile loadtest up --abort-on-container-exit locust-master locust-worker
+#
+# Watch the generator too (`docker stats`): if it saturates before the API,
+# the numbers describe the generator, not the service.
+# Degradation search: LOCUST_STEP_LOAD=1 replaces users/spawn rate with a
+# staircase (see locustfile.py): +LOCUST_STEP_USERS every LOCUST_STEP_SECONDS up
+# to LOCUST_STEP_MAX_USERS.
+#   mkdir -p results
+#   LOCUST_STEP_LOAD=1 LOCUST_ARGS="--headless --csv /mnt/results/steps" \
+#   docker compose --profile loadtest up --abort-on-container-exit locust-master locust-worker
+#
+# Settings come from .env at the repository root (LOCUST_HOST, LOCUST_WORKERS,
+# LOCUST_PORT, LOCUST_ARGS, LOCUST_STEP_*; see .env.example). A variable set in
+# the shell, as in the examples above, overrides .env for that run. Standalone
+# runs from this folder pass the file with --env-file ../../.env.
+
+x-locust: &locust
+  image: locustio/locust:2.46.7
+  profiles: [ "loadtest" ]
+  environment:
+    LOCUST_STEP_LOAD: ${LOCUST_STEP_LOAD:?}
+    LOCUST_STEP_USERS: ${LOCUST_STEP_USERS:?}
+    LOCUST_STEP_SECONDS: ${LOCUST_STEP_SECONDS:?}
+    LOCUST_STEP_MAX_USERS: ${LOCUST_STEP_MAX_USERS:?}
+  volumes:
+    - .:/mnt/locust:ro
+
+services:
+  locust-master:
+    <<: *locust
+    container_name: real-estate-locust-master
+    command: >-
+      -f /mnt/locust/locustfile.py --master
+      --host ${LOCUST_HOST:?}
+      --expect-workers ${LOCUST_WORKERS:?} ${LOCUST_ARGS?}
+    ports:
+      - "${LOCUST_PORT:?}:8089"
+    volumes:
+      - .:/mnt/locust:ro
+      - ./results:/mnt/results
+
+  # Workers generate the traffic; the master only coordinates and aggregates.
+  # One worker per generator CPU core is a reasonable default.
+  locust-worker:
+    <<: *locust
+    command: -f /mnt/locust/locustfile.py --worker --master-host locust-master
+    deploy:
+      replicas: ${LOCUST_WORKERS:?}
+    depends_on:
+      - locust-master

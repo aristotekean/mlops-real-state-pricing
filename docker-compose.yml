@@ -1,0 +1,263 @@
+# Real Estate MLOps · docker compose (full local development stack)
+#
+#   S1 mlflow-db   PostgreSQL  <--->  S2 MLflow        (experiments, runs, registry metadata)
+#   S3 MinIO                   <--->  S2 MLflow        (artifacts: models, metrics, plots)
+#   S4 Inference API           <--->  S2 MLflow        (loads the registered model to serve)
+#   S5 postgres-train + S6 Airflow     see services/airflow/compose.yml (included below)
+#   S7 Frontend                ---->  S4 Inference API (Streamlit UI)
+#   S8 Prometheus + S9 Grafana         see infra/monitoring/docker-compose.yml (`monitoring` profile)
+#
+# From the repository root:
+#   docker compose up -d --build     # build the project images on this host
+#   docker compose up -d             # or pull them from DockerHub (multi-arch)
+# The project images are published for linux/amd64 and linux/arm64 by
+# scripts/publish_images.sh, so the same tags run on an Apple Silicon Mac and
+# on a Linux server or VM. On Linux set AIRFLOW_UID to your user id first so
+# Airflow can write the bind-mounted folders.
+#
+# Configuration: every value (credentials, ports, image tag, model, Locust and
+# monitoring settings) comes from .env at the repository root; there are no
+# defaults here. Create it with `cp .env.example .env`. A missing variable
+# stops compose with "required variable ... is missing a value".
+#
+# Locust (Server B) is behind the `loadtest` profile, so it never starts by
+# default and does not compete with the API for CPU:
+#   docker compose --profile loadtest up -d     # see infra/load-testing
+# Prometheus + Grafana (Server C) are behind the `monitoring` profile:
+#   docker compose --profile monitoring up -d   # full stack + monitoring
+#   docker compose up -d prometheus grafana     # monitoring only (naming a
+#                                               # service enables its profile)
+#
+# The API serves the model registered in MLflow under the `production` alias.
+# Until a training DAG registers one, the API starts in `unavailable` state
+# (`/predict` answers 503) and keeps polling the registry every
+# MODEL_REFRESH_SECONDS; every request is logged to inference.logs on
+# postgres-train.
+
+name: real_estate
+
+include:
+  - path: services/airflow/compose.yml
+  - path: infra/load-testing/docker-compose.yml
+  - path: infra/monitoring/docker-compose.yml
+
+x-mlflow-client-env: &mlflow-client-env
+  MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:?}
+  # Artifacts are proxied by the server (--serve-artifacts), so clients only
+  # need the tracking URI. The S3 variables are kept so direct access to the
+  # bucket also works when needed.
+  MLFLOW_S3_ENDPOINT_URL: ${MLFLOW_S3_ENDPOINT_URL:?}
+  AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:?}
+  AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?}
+
+services:
+  # ------------------------------------------------------------------------- #
+  # S1 · PostgreSQL (MLflow backend store, internal to the stack, own volume)
+  # ------------------------------------------------------------------------- #
+  mlflow-db:
+    image: postgres:16
+    container_name: real-estate-mlflow-db
+    environment:
+      POSTGRES_DB: ${MLFLOW_DB_NAME:?}
+      POSTGRES_USER: ${MLFLOW_DB_USER:?}
+      POSTGRES_PASSWORD: ${MLFLOW_DB_PASSWORD:?}
+    ports:
+      - "${MLFLOW_DB_PORT:?}:5432"
+    volumes:
+      - mlflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "${MLFLOW_DB_USER:?}", "-d", "${MLFLOW_DB_NAME:?}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------------- #
+  # S3 · MinIO (artifact store for MLflow)
+  #
+  # Chainguard build of MinIO (MinIO removed its own public images in 2026-09).
+  # Distroless-style image: runs as uid 65532, ships `minio` and `mc` only.
+  # ------------------------------------------------------------------------- #
+  minio:
+    image: cgr.dev/chainguard/minio:latest
+    container_name: real-estate-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?}
+      # `public` lets Prometheus (infra/monitoring) scrape /minio/v2/metrics/*
+      # without a bearer token. Only usage/traffic counters are exposed, never
+      # objects.
+      MINIO_PROMETHEUS_AUTH_TYPE: ${MINIO_PROMETHEUS_AUTH_TYPE:?}
+    ports:
+      - "${MINIO_PORT:?}:9000"
+      - "${MINIO_CONSOLE_PORT:?}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: [ "CMD", "mc", "ready", "local" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  # One-shot: MinIO does not create buckets on start. Reuse the same image
+  # (it ships `mc`) to create the MLflow artifact bucket before the server
+  # comes up.
+  minio-init:
+    image: cgr.dev/chainguard/minio:latest
+    container_name: real-estate-minio-init
+    entrypoint: [ "/bin/sh", "-c" ]
+    # Credentials and bucket go through the environment and are expanded by
+    # the container shell ($$), so special characters in them are safe.
+    command:
+      - |
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        mc mb --ignore-existing "local/$$MLFLOW_ARTIFACTS_BUCKET"
+        echo "bucket ready: $$MLFLOW_ARTIFACTS_BUCKET"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?}
+      MLFLOW_ARTIFACTS_BUCKET: ${MLFLOW_ARTIFACTS_BUCKET:?}
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  # ------------------------------------------------------------------------- #
+  # S2 · MLflow (tracking server + model registry)
+  #
+  # Backend store: mlflow-db. Artifacts: MinIO bucket `mlflow`, proxied through
+  # the server so clients never need bucket credentials.
+  #
+  # Official MLflow image. It ships MLflow only, so the two client libraries
+  # the server needs (psycopg2 for Postgres, boto3 for S3/MinIO) are installed
+  # at container start instead of baking a custom image. This needs network
+  # access on every start and adds ~30-60 s before the server is up (see
+  # start_period). Pin both versions to keep starts reproducible.
+  # ------------------------------------------------------------------------- #
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v3.16.1
+    container_name: real-estate-mlflow
+    entrypoint: [ "/bin/sh", "-c" ]
+    command:
+      - |
+        pip install --no-cache-dir --quiet \
+          psycopg2-binary==2.9.10 \
+          boto3==1.40.49
+        # DNS-rebinding guard (--allowed-hosts): requests whose Host header is
+        # not listed get 403 (only /health is exempt). The in-network service
+        # name (clients) and the OrbStack domain are allowed; on a Linux
+        # server or VM add the IP/hostname used to open the UI through
+        # MLFLOW_ALLOWED_HOSTS, e.g. 192.168.1.50:*.
+        # CSRF guard (--cors-allowed-origins): POSTs whose Origin is neither
+        # localhost nor listed get 403; add the UI origin from another machine
+        # through MLFLOW_CORS_ALLOWED_ORIGINS, e.g. http://192.168.1.50:5001.
+        # The database credentials and the bucket are expanded by the
+        # container shell ($$) from the environment below.
+        exec mlflow server \
+          --host 0.0.0.0 \
+          --port 5000 \
+          --backend-store-uri "postgresql+psycopg2://$${MLFLOW_DB_USER}:$${MLFLOW_DB_PASSWORD}@mlflow-db:5432/$${MLFLOW_DB_NAME}" \
+          --artifacts-destination "s3://$${MLFLOW_ARTIFACTS_BUCKET}" \
+          --serve-artifacts \
+          --allowed-hosts "localhost:*,127.0.0.1:*,mlflow:*,*.orb.local${MLFLOW_ALLOWED_HOSTS:+,${MLFLOW_ALLOWED_HOSTS}}" \
+          --cors-allowed-origins "http://*.orb.local${MLFLOW_CORS_ALLOWED_ORIGINS:+,${MLFLOW_CORS_ALLOWED_ORIGINS}}"
+    environment:
+      MLFLOW_DB_NAME: ${MLFLOW_DB_NAME:?}
+      MLFLOW_DB_USER: ${MLFLOW_DB_USER:?}
+      MLFLOW_DB_PASSWORD: ${MLFLOW_DB_PASSWORD:?}
+      MLFLOW_ARTIFACTS_BUCKET: ${MLFLOW_ARTIFACTS_BUCKET:?}
+      MLFLOW_S3_ENDPOINT_URL: ${MLFLOW_S3_ENDPOINT_URL:?}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:?}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?}
+    ports:
+      # Host port 5001: macOS AirPlay Receiver squats 5000 on the host.
+      - "${MLFLOW_PORT:?}:5000"
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:5000/health', timeout=4)" ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      # Covers the pip install at start plus MLflow's own boot.
+      start_period: 90s
+    depends_on:
+      mlflow-db:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------------- #
+  # S4 · Inference API (serves the model registered in MLflow)
+  #
+  # Built from services/api-inference/Dockerfile with the repository root as
+  # context. Single replica with a published host port for local development;
+  # in the cluster the Ingress controller fronts it instead.
+  # ------------------------------------------------------------------------- #
+  api-inference:
+    image: ${DOCKERHUB_USER:?}/real-estate-api-inference:${IMAGE_TAG:?}
+    build:
+      context: .
+      dockerfile: services/api-inference/Dockerfile
+    container_name: real-estate-api-inference
+    ports:
+      - "${API_PORT:?}:8000"
+    environment:
+      <<: *mlflow-client-env
+      MODEL_NAME: ${MODEL_NAME:?}
+      # Registry alias resolved at startup: models:/<MODEL_NAME>@<MODEL_ALIAS>
+      MODEL_ALIAS: ${MODEL_ALIAS:?}
+      # Background poll of the alias; a new production version is picked up
+      # without restarting the container (0 disables it).
+      MODEL_REFRESH_SECONDS: ${MODEL_REFRESH_SECONDS:?}
+      # inference.logs lives in the training database (S5).
+      TRAIN_DB_HOST: ${TRAIN_DB_HOST:?}
+      TRAIN_DB_PORT: ${TRAIN_DB_PORT:?}
+      TRAIN_DB_NAME: ${TRAIN_DB_NAME:?}
+      TRAIN_DB_USER: ${TRAIN_DB_USER:?}
+      TRAIN_DB_PASSWORD: ${TRAIN_DB_PASSWORD:?}
+    # On-disk spool for inference.logs rows written while postgres-train is
+    # down (default INFERENCE_LOG_SPOOL_PATH=spool/inference-logs.jsonl under
+    # /app); a named volume keeps them across container restarts.
+    volumes:
+      - api-inference-spool:/app/spool
+    deploy:
+      resources:
+        limits:
+          cpus: "${API_CPUS:?}"
+          memory: ${API_MEMORY:?}
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      postgres-train:
+        condition: service_healthy
+      train-db-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------------- #
+  # S7 · Frontend (Streamlit UI; talks to the Inference API only)
+  # ------------------------------------------------------------------------- #
+  frontend:
+    image: ${DOCKERHUB_USER:?}/real-estate-frontend:${IMAGE_TAG:?}
+    build:
+      context: .
+      dockerfile: services/frontend/Dockerfile
+    container_name: real-estate-frontend
+    ports:
+      - "${FRONTEND_PORT:?}:8501"
+    environment:
+      API_URL: ${API_URL:?}
+    depends_on:
+      - api-inference
+    restart: unless-stopped
+
+volumes:
+  api-inference-spool:
+    name: real_estate_api_inference_spool
+  mlflow-db-data:
+    name: real_estate_mlflow_db
+  minio-data:
+    name: real_estate_minio

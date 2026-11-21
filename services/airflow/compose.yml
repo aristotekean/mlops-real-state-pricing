@@ -1,0 +1,222 @@
+# Real Estate MLOps · Airflow slice (S5 + S6)
+#
+# Included by the root docker-compose.yml. Paths are relative to this file.
+#
+#   S5 postgres-train  PostgreSQL  <--->  S6 Airflow   (training data read by the DAGs)
+#   S6 Airflow                     --->   S2 MLflow    (logs runs, registers the model)
+#
+# Two isolated Postgres instances, each with its own volume:
+#   - airflow-db      : Airflow metadata only (internal, not published to the host)
+#   - postgres-train  : training database read by the DAGs
+#
+# Every value comes from .env at the repository root (see .env.example).
+# Standalone (Airflow only, from the repository root), passing it explicitly
+# because the project directory is then services/airflow:
+#   docker compose --env-file .env -f services/airflow/compose.yml up -d --build
+
+x-airflow-common: &airflow-common
+  image: ${DOCKERHUB_USER:?}/real-estate-airflow:${IMAGE_TAG:?}
+  build:
+    context: ../..
+    dockerfile: services/airflow/Dockerfile
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER:?}:${AIRFLOW_DB_PASSWORD:?}@airflow-db:5432/${AIRFLOW_DB_NAME:?}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY?}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?}
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # S5 · training database the DAGs read from
+    TRAIN_DB_HOST: ${TRAIN_DB_HOST:?}
+    TRAIN_DB_PORT: ${TRAIN_DB_PORT:?}
+    TRAIN_DB_NAME: ${TRAIN_DB_NAME:?}
+    TRAIN_DB_USER: ${TRAIN_DB_USER:?}
+    TRAIN_DB_PASSWORD: ${TRAIN_DB_PASSWORD:?}
+    REAL_ESTATE_DATASET_PATH: ${REAL_ESTATE_DATASET_PATH:?}
+    REAL_ESTATE_SOURCE_URI: ${REAL_ESTATE_SOURCE_URI:?}
+    # S2 · MLflow tracking server (artifacts proxied by the server)
+    MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:?}
+    MLFLOW_EXPERIMENT_NAME: ${MLFLOW_EXPERIMENT_NAME:?}
+    MLFLOW_S3_ENDPOINT_URL: ${MLFLOW_S3_ENDPOINT_URL:?}
+    AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:?}
+    AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?}
+    MODEL_NAME: ${MODEL_NAME:?}
+    MODEL_ALIAS: ${MODEL_ALIAS:?}
+    # Each run loads the next RAW batch, so a short interval replays the
+    # incremental arrival of the 7 batches in about an hour.
+    REAL_ESTATE_TRAINING_SCHEDULE: ${REAL_ESTATE_TRAINING_SCHEDULE:?}
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./config:/opt/airflow/config
+    - ../../data/RealEstate:/opt/airflow/data/RealEstate
+  # On Linux bind mounts keep the host's ownership, so the Airflow user must be
+  # the host user (AIRFLOW_UID=$(id -u) in .env) to write logs and download the
+  # dataset. Docker Desktop/OrbStack on macOS map ownership, so 50000 works.
+  user: "${AIRFLOW_UID:?}:0"
+  depends_on: &airflow-common-depends-on
+    airflow-db:
+      condition: service_healthy
+    postgres-train:
+      condition: service_healthy
+    train-db-migrate:
+      condition: service_completed_successfully
+
+services:
+  # ------------------------------------------------------------------------- #
+  # S5 · PostgreSQL (training database)
+  # ------------------------------------------------------------------------- #
+  postgres-train:
+    image: postgres:16
+    container_name: real-estate-postgres-train
+    environment:
+      POSTGRES_DB: ${TRAIN_DB_NAME:?}
+      POSTGRES_USER: ${TRAIN_DB_USER:?}
+      POSTGRES_PASSWORD: ${TRAIN_DB_PASSWORD:?}
+    ports:
+      # Change POSTGRES_TRAIN_PORT if the host already runs PostgreSQL.
+      - "${POSTGRES_TRAIN_PORT:?}:5432"
+    volumes:
+      - postgres-train-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "${TRAIN_DB_USER:?}", "-d", "${TRAIN_DB_NAME:?}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # One-shot: applies pending infra/database/migrations (RAW, CLEAN and
+  # INFERENCE schemas) before any DAG can touch the training database.
+  train-db-migrate:
+    image: postgres:16
+    container_name: real-estate-train-db-migrate
+    entrypoint: [ "sh", "/database/migrate.sh" ]
+    environment:
+      PGHOST: ${TRAIN_DB_HOST:?}
+      PGPORT: ${TRAIN_DB_PORT:?}
+      PGDATABASE: ${TRAIN_DB_NAME:?}
+      PGUSER: ${TRAIN_DB_USER:?}
+      PGPASSWORD: ${TRAIN_DB_PASSWORD:?}
+    volumes:
+      - ../../infra/database:/database:ro
+    depends_on:
+      postgres-train:
+        condition: service_healthy
+
+  # ------------------------------------------------------------------------- #
+  # Airflow metadata database (internal to the stack, separate volume)
+  # ------------------------------------------------------------------------- #
+  airflow-db:
+    image: postgres:16
+    container_name: real-estate-airflow-db
+    environment:
+      POSTGRES_DB: ${AIRFLOW_DB_NAME:?}
+      POSTGRES_USER: ${AIRFLOW_DB_USER:?}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:?}
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "${AIRFLOW_DB_USER:?}", "-d", "${AIRFLOW_DB_NAME:?}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------------- #
+  # S6 · Airflow (LocalExecutor: api-server + scheduler + dag-processor + triggerer)
+  # ------------------------------------------------------------------------- #
+  airflow-init:
+    <<: *airflow-common
+    container_name: real-estate-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/{logs,dags,plugins,config,data/RealEstate}
+        chown -R "${AIRFLOW_UID:?}:0" /opt/airflow/{logs,dags,plugins,config,data/RealEstate}
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:?}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?}
+    user: "0:0"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: real-estate-airflow-apiserver
+    command: api-server
+    ports:
+      - "${AIRFLOW_PORT:?}:8080"
+    healthcheck:
+      test: [ "CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: real-estate-airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: [ "CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"' ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: real-estate-airflow-dag-processor
+    command: dag-processor
+    healthcheck:
+      test: [ "CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"' ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: real-estate-airflow-triggerer
+    command: triggerer
+    healthcheck:
+      test: [ "CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"' ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-train-data:
+    name: real_estate_postgres_train
+  airflow-db-data:
+    name: real_estate_airflow_db

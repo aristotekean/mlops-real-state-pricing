@@ -1,0 +1,42 @@
+# S6 · Airflow 3 (LocalExecutor) running the real_estate training DAG: the
+# `airflow-init` Job migrates the metadata database and creates the admin user,
+# then ONE pod runs api-server + scheduler + dag-processor + triggerer. The web
+# UI / REST API is reached as `airflow-apiserver` on port 8080 (same hostname as
+# in services/airflow/compose.yml).
+#
+# DAGs and the `scripts` package are baked into the image
+# (services/airflow/Dockerfile), so there is no ConfigMap for dags/config/plugins.
+# The metadata database lives in base/postgres-airflow; the training database
+# (postgres-train), MLflow and MinIO come from the other bases.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - pvc.yaml
+  - job-init.yaml
+  - deployment.yaml
+  - service.yaml
+
+# `airflow-env`: non-secret environment attached with `envFrom` to the init Job
+# and to the four Airflow containers. The fixed Airflow settings live here; the
+# deployment-specific values (TRAIN_DB_HOST/PORT, dataset path and URI, MLflow
+# experiment, model name and alias, REAL_ESTATE_TRAINING_SCHEDULE) are merged in
+# from .env by infra/k8s/generated. Secrets (`airflow-secrets`,
+# `airflow-admin-user`, `postgres-train-credentials`) and the MLflow/MinIO
+# client settings (`mlflow-client-env`, `minio-credentials`) come from .env too
+# and are attached separately.
+configMapGenerator:
+  - name: airflow-env
+    literals:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__CORE__AUTH_MANAGER=airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+      - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=true
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      # Task runners (subprocesses of the scheduler) call the execution API of
+      # the api-server container in the SAME pod, so localhost is used instead
+      # of the `airflow-apiserver` Service: it does not depend on that
+      # Service's readiness gate and never leaves the pod. The Service stays
+      # for the Ingress and the UI. The path must keep its trailing slash.
+      - AIRFLOW__CORE__EXECUTION_API_SERVER_URL=http://localhost:8080/execution/
+      # Lets /api/v2/monitor/health report the scheduler heartbeat.
+      - AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK=true

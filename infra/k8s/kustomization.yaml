@@ -1,0 +1,44 @@
+# Kustomize root for Server A of the real estate MLOps stack on Kubernetes
+# (OrbStack locally; any cluster with a default StorageClass otherwise).
+#
+# Usage (configuration and image tags come from .env at the repository root):
+#   bash infra/k8s/scripts/render-env.sh  # .env -> generated/ (after every change)
+#   kubectl apply -k infra/k8s            # deploy / update everything
+#   kubectl kustomize infra/k8s           # render the manifests only
+#   kubectl -n real_estate get pods          # watch the rollout
+#
+# Everything lands in the `real_estate` namespace. Project images are named
+# without a tag in the manifests; generated/ rewrites them to
+# DOCKERHUB_USER/<image>:IMAGE_TAG from .env. Third-party images follow docker-compose.yml: postgres and mlflow are pinned
+# in their own manifests; MinIO deliberately tracks
+# `cgr.dev/chainguard/minio:latest` (pinning it is out of scope for now).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: real_estate
+
+# Shared label on every object (metadata and pod templates, not selectors, so
+# adding or renaming it never breaks an existing Deployment/Service pairing).
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: real_estate
+    includeSelectors: false
+    includeTemplates: true
+
+resources:
+  - base/config
+  - base/postgres-mlflow
+  - base/minio
+  - base/mlflow
+  - base/postgres-train
+  - base/api-inference
+  - base/frontend
+  - base/postgres-airflow
+  - base/airflow
+  - base/ingress
+
+# ConfigMaps, Secrets and project image tags rendered from .env by
+# scripts/render-env.sh (git-ignored: it holds the credentials). Without it the
+# build fails with "generated: no such file or directory": render it first.
+components:
+  - generated
