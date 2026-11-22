@@ -36,6 +36,7 @@ resources:
   - base/rustfs
   - base/mlflow
   - base/postgres-train
+  - base/data-api
   - base/api-inference
   - base/frontend
   - base/postgres-airflow

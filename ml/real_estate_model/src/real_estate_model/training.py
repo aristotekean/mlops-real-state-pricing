@@ -17,9 +17,9 @@ from real_estate_model.features import engineer_features
 from real_estate_model.models import (
     CANDIDATES,
     PRIMARY_METRIC,
-    PRIMARY_METRIC_GREATER_IS_BETTER,
     build_candidate,
     evaluate,
+    metric_greater_is_better,
 )
 from real_estate_model.splits import SPLIT_NAMES, assign_split
 
@@ -71,7 +71,10 @@ def train_candidates(
     return results
 
 
-def best_candidate(results: dict[str, tuple[Pipeline, dict[str, float]]]) -> str:
-    """Return the candidate with the best primary selection metric."""
-    choose = max if PRIMARY_METRIC_GREATER_IS_BETTER else min
-    return choose(results, key=lambda name: results[name][1][PRIMARY_METRIC])
+def best_candidate(
+    results: dict[str, tuple[Pipeline, dict[str, float]]],
+    metric: str = PRIMARY_METRIC,
+) -> str:
+    """Return the candidate with the best ``metric`` (default: primary metric)."""
+    choose = max if metric_greater_is_better(metric) else min
+    return choose(results, key=lambda name: results[name][1][metric])

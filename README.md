@@ -2,7 +2,7 @@
 
 **Grupo 6:** Kevin Bueno · Juan Camilo Martínez · Jorge Andrés Gil
 
-Plataforma MLOps de extremo a extremo para predecir el riesgo de readmisión hospitalaria en pacientes con diabetes (dataset Diabetes 130-US hospitals, clases `NO`, `>30` y `<30`). Airflow carga los datos por lotes en PostgreSQL, entrena tres candidatos y registra el mejor en MLflow con el alias `production`; los artefactos viven en RustFS, una API FastAPI sirve `models:/real_estate@production` en `POST /predict` y un frontend Streamlit lo consulta. Todo Server A corre en Kubernetes (OrbStack) con autoescalado de la API; Locust (Server B) genera carga y Prometheus + Grafana (Server C) la observan.
+Plataforma MLOps de extremo a extremo para estimar el precio de propiedades inmobiliarias. Airflow consume la API de datos del curso lote a lote (grupo 6), valida cada lote, lo guarda en RAW y CLEAN, decide con reglas explícitas si reentrena y registra el candidato en MLflow, donde solo recibe el alias `production` si supera al modelo productivo; los artefactos viven en RustFS (almacén S3), una API FastAPI sirve `models:/real_estate@production` en `POST /predict` y un frontend Streamlit lo consulta. Todo Server A corre en Kubernetes (OrbStack) con autoescalado de la API; Locust (Server B) genera carga y Prometheus + Grafana (Server C) la observan.
 
 ## Ruta rápida
 
@@ -108,7 +108,7 @@ flowchart TB
         ml --> svcmldb["svc mlflow-db"] --> mldb[("StatefulSet mlflow-db<br/>PVC data-mlflow-db-0 · 2Gi")]
         ml --> svcrustfs["svc rustfs"] --> rustfs[("StatefulSet rustfs<br/>PVC data-rustfs-0 · 5Gi")]
         api & af -->|"models:/ · runs"| svcml
-        af --- pvcaf[("PVC airflow-dataset · 1Gi")]
+        af --- pvcaf[("PVC airflow-logs · 2Gi")]
 
         jmig["Job train-db-migrate<br/>ConfigMap train-db-migrations"] --> svcpt
         jrustfs["Job rustfs-init<br/>bucket mlflow"] --> svcrustfs
@@ -126,11 +126,11 @@ Las bases de datos y RustFS son `StatefulSet` con una réplica: el pod tiene ide
 | `mlflow-db` | StatefulSet | `mlflow-db-env` | `mlflow-db-credentials` | `data-mlflow-db-0` (2Gi) | readiness, liveness (`pg_isready`) | 100m/256Mi → 500m/512Mi |
 | `airflow-db` | StatefulSet | `airflow-db-env` | `airflow-db-credentials` | `data-airflow-db-0` (2Gi) | readiness, liveness (`pg_isready`) | 100m/256Mi → 500m/512Mi |
 | `postgres-train` | StatefulSet + Job `train-db-migrate` | `postgres-train-env`, `train-db-migrations` | `postgres-train-credentials` | `data-postgres-train-0` (2Gi) | readiness, liveness (`pg_isready`) | 100m/256Mi → 500m/512Mi |
-| `rustfs` | StatefulSet + Job `rustfs-init` | — | `rustfs-credentials` | `data-rustfs-0` (5Gi) | readiness, liveness (`/health/*`) | 100m/256Mi → 500m/1Gi |
+| `rustfs` | StatefulSet + Job `rustfs-init` | — | `rustfs-credentials` | `data-rustfs-0` (5Gi) | readiness, liveness (`/health/ready`, `/health/live`) | 100m/256Mi → 500m/1Gi |
 | `mlflow` | Deployment | `mlflow-server-env`, `mlflow-client-env` | `mlflow-db-credentials`, `rustfs-credentials` | sin estado (Postgres + RustFS) | startup, readiness, liveness (`/health`) | 250m/512Mi → 1/2Gi |
 | `api-inference` | Deployment + HPA | `api-inference-env`, `mlflow-client-env` | `postgres-train-credentials`, `rustfs-credentials` | `emptyDir` spool (256Mi) | startup, readiness, liveness (`/health`) | 250m/512Mi → 1/1Gi |
 | `frontend` | Deployment | `frontend-env` | ninguno (no maneja credenciales) | sin estado | startup, readiness, liveness | 100m/256Mi → 500m/512Mi |
-| `airflow` | Deployment + Job `airflow-init` | `airflow-env`, `mlflow-client-env` | `airflow-secrets`, `airflow-db-credentials`, `airflow-admin-user`, `rustfs-credentials`, `postgres-train-credentials` | `airflow-dataset` (1Gi) | api-server: startup, readiness, liveness; scheduler, dag-processor y triggerer: liveness | api-server 250m/512Mi → 500m/1Gi · scheduler 500m/1Gi → 1/2Gi · dag-processor 150m/256Mi → 250m/768Mi · triggerer 100m/256Mi → 250m/768Mi |
+| `airflow` | Deployment + Job `airflow-init` | `airflow-env`, `mlflow-client-env` | `airflow-secrets`, `airflow-db-credentials`, `airflow-admin-user`, `rustfs-credentials`, `postgres-train-credentials` | `airflow-logs` (2Gi, logs de tareas) | api-server: startup, readiness, liveness; scheduler, dag-processor y triggerer: liveness | api-server 250m/512Mi → 500m/1Gi · scheduler 500m/1.5Gi → 2/4Gi · dag-processor 150m/256Mi → 250m/768Mi · triggerer 100m/256Mi → 250m/768Mi |
 
 Los init containers de espera (`pg_isready`, `mc`) y los Jobs también declaran `requests` y `limits`; `bash infra/k8s/scripts/check.sh` renderiza `.env` y valida que el kustomize construya antes de commitear.
 
@@ -169,47 +169,27 @@ kubectl apply -f infra/argocd/application.yaml
 
 ## Datos en PostgreSQL
 
-`infra/database/migrations` crea tres esquemas en `postgres-train`. En Kubernetes los aplica el Job `train-db-migrate` (ConfigMap generado con `infra/k8s/scripts/render-migrations.sh`); en compose, el servicio del mismo nombre.
+`infra/database/migrations` crea los esquemas en `postgres-train`, una base distinta de la de metadatos de MLflow (`mlflow-db`). En Kubernetes los aplica el Job `train-db-migrate` (ConfigMap generado con `infra/k8s/scripts/render-migrations.sh`); en compose, el servicio del mismo nombre.
 
 | Esquema | Contenido |
 |---------|-----------|
-| `raw` | Filas tal como llegan del CSV, por lote, con checksum y estado `validated` / `rejected` y su motivo |
-| `clean` | Registros transformados por versión de transformación (`readmission-features-v2`), con partición `train` / `validation` / `test` por paciente |
-| `inference` | `inference.logs`: una fila por petición a `/predict`, incluidas las fallidas, con entrada, salida, modelo y tiempo |
-
-El dataset se descarga desde Google Drive al volumen persistente de Airflow en la primera corrida (`scripts/download_real_estate_dataset.py` hace lo mismo en local). El diseño de las tablas, las reglas de trazabilidad y el contrato de entrada y salida están en [docs/data-contract.md](docs/data-contract.md).
+| `raw` | `raw.api_requests`: cada petición a la API de datos y su resultado (lote nuevo, duplicado, fin de datos, error). `raw.batches`: cada respuesta de la API de datos tal cual (gzip + SHA-256), con número de lote, esquema recibido y estado. `raw.records`: cada registro sin modificar (JSONB), con estado `validated` / `rejected` y su motivo |
+| `clean` | Registros tipados listos para entrenar, con trazabilidad a RAW (`raw_record_id`, `batch_id`), motivo de exclusión (outliers) y partición `train` / `validation` / `test` por propiedad |
+| `audit` | `audit.batch_history`: una fila por lote con validaciones, drift, categorías nuevas, decisión de entrenamiento y su motivo, IDs de MLflow, métricas y promoción (historial para Streamlit) |
+| `inference` | `inference.logs`: una fila por petición a `/predict` (fase de inferencia) |
 
 ## Entrenamiento y registro del modelo
 
-```mermaid
-sequenceDiagram
-    participant AF as Airflow
-    participant P as postgres-train
-    participant M as MLflow
-    participant S as RustFS
-    participant A as api-inference
+Los datos llegan de la API del curso (`cristiandiaz13/mlops-puj:data-api-pf-v2`, Deployment `data-api`, **grupo 6**, 6 lotes). Cada corrida del DAG `real_estate_incremental_training` pide **un** lote, lo guarda en RAW, lo valida (esquema, calidad, categorías nuevas, drift), lo procesa a CLEAN y decide con reglas explícitas si entrena. Si entrena, compara el candidato contra el modelo productivo y solo mueve el alias `production` si mejora según la regla de promoción.
 
-    AF->>P: ingest_next_batch (hasta 15.000 filas a raw.records)
-    AF->>P: validate_raw_quality · preprocess_raw_to_clean · split_dataset
-    AF->>AF: check_training_needed (omite si no hay datos nuevos)
-    AF->>M: train_candidates: 3 runs anidados (params, métricas, matrices de confusión)
-    M->>S: artefactos de cada run
-    AF->>M: register_best_model por macro-F1 de validación
-    AF->>M: compare_with_champion · promote_model (mueve el alias production solo si mejora)
-    A->>M: models:/real_estate@production (cada 60 s)
-    A->>P: inference.logs por cada /predict
-```
-
-El DAG `real_estate_incremental_training` simula la llegada incremental de datos: cada corrida carga un lote nuevo y reentrena con todo lo acumulado. Corre cada 10 minutos (`REAL_ESTATE_TRAINING_SCHEDULE`), sin catchup, con una sola ejecución activa y dos reintentos por tarea. Es reejecutable: los lotes tienen IDs deterministas, RAW es único por checksum y fila, y cada versión registrada lleva la huella del snapshot de CLEAN con el que se entrenó. Cargados los 7 lotes, las corridas siguientes no entrenan.
-
-El paquete compartido `ml/real_estate_model` implementa el contrato, las 37 variables, la partición y los candidatos una sola vez, y lo reutilizan el DAG y la API.
+El diseño completo, las reglas de decisión y de promoción y la tabla de parámetros ajustables están en **[docs/pipeline.md](docs/pipeline.md)**. Los umbrales viven en el ConfigMap `pipeline-config` de [infra/k8s/base/airflow/kustomization.yaml](infra/k8s/base/airflow/kustomization.yaml).
 
 | Qué se registra | Detalle |
 |-----------------|---------|
-| Candidatos | Regresión logística, gradient boosting y random forest, como runs anidados del experimento `diabetes-readmission` |
-| Métrica principal | Macro-F1 de validación: las clases están desbalanceadas (`<30` es el 11 %) y pondera las tres por igual |
-| Selección | Con el dataset completo gana gradient boosting (macro-F1 0,441 en validación y test) frente a 0,425 de la regresión logística |
-| Promoción | La versión nueva se evalúa contra la productiva sobre la misma validación; el alias `production` solo se mueve si mejora |
+| Candidatos | Ridge e HistGradientBoosting sobre `log1p(price)`, como runs anidados del experimento `real-estate-pricing` |
+| Métrica principal | MAE de validación (USD, interpretable), con RMSE como métrica de control |
+| Promoción | Se promueve si el MAE mejora ≥ 3 % y el RMSE no empeora más de 1 % frente al productivo, ambos evaluados sobre la misma validación |
+| Trazabilidad | Lotes usados, commit (`GIT_COMMIT`), parámetros, métricas train/validation/test, gráficos, importancia por permutación y motivo del entrenamiento |
 
 ## Estructura del repositorio
 
@@ -241,6 +221,7 @@ Cada aplicación se prueba por separado con `uv`; ninguna necesita red, MLflow n
 cd services/api-inference && uv sync && uv run pytest -q
 cd services/frontend && uv sync && uv run pytest -q
 python3 -m venv .venv && .venv/bin/pip install -e ./ml/real_estate_model pytest && .venv/bin/python -m pytest ml/real_estate_model/tests
+uv run --no-project --with-requirements services/airflow/tests/requirements.txt --with-editable ml/real_estate_model python -m pytest services/airflow/tests
 ```
 
 | Suite | Qué verifica |
@@ -248,6 +229,7 @@ python3 -m venv .venv && .venv/bin/pip install -e ./ml/real_estate_model pytest 
 | `services/api-inference/tests` | `/health` y `/model-info` con y sin modelo, una predicción por petición, `422` ante campos faltantes o tipos incorrectos, `503` sin modelo y las métricas Prometheus |
 | `services/frontend/tests` | El cliente HTTP de la API y la construcción de los 44 campos del formulario |
 | `ml/real_estate_model/tests` | El contrato de entrada, la ingeniería de características y los candidatos |
+| `services/airflow/tests` | Las reglas de entrenamiento y de promoción, el cliente de la API de datos, el PSI y la versión de CLEAN |
 
 ## Operación
 
@@ -296,7 +278,7 @@ Los tres repositorios públicos del namespace `aristotekean`: `real-estate-airfl
 
 ### 2. Clúster de Kubernetes
 
-OrbStack con el namespace `real-estate` en ejecución: los pods de `airflow`, `airflow-db`, `api-inference`, `frontend`, `minio`, `mlflow`, `mlflow-db` y `postgres-train`, más `ingress-nginx-controller`. El detalle del pod de Airflow muestra los `initContainers` `wait-for-airflow-db` y `wait-for-migrations` y los cuatro contenedores (api-server, dag-processor, scheduler y triggerer). La salida de `kubectl get svc -A` y `kubectl get ingress -A` muestra los Services del namespace, el LoadBalancer del Ingress controller y el Ingress `real_estate` con los hosts `frontend`, `api`, `mlflow` y `airflow` en `k8s.orb.local`.
+OrbStack con el namespace `real-estate` en ejecución: los pods de `airflow`, `airflow-db`, `api-inference`, `frontend`, `minio` (hoy `rustfs`), `mlflow`, `mlflow-db` y `postgres-train`, más `ingress-nginx-controller`. El detalle del pod de Airflow muestra los `initContainers` `wait-for-airflow-db` y `wait-for-migrations` y los cuatro contenedores (api-server, dag-processor, scheduler y triggerer). La salida de `kubectl get svc -A` y `kubectl get ingress -A` muestra los Services del namespace, el LoadBalancer del Ingress controller y el Ingress `real_estate` con los hosts `frontend`, `api`, `mlflow` y `airflow` en `k8s.orb.local`.
 
 ![Clúster de Kubernetes](docs/images/3-kubernetes-cluster.png)
 
@@ -326,6 +308,6 @@ Streamlit en `frontend.k8s.orb.local`: la barra lateral confirma la API disponib
 
 ### 6. Experimentos en MLflow
 
-MLflow 3.16.1 en `mlflow.k8s.orb.local`, experimento `diabetes-readmission` con los runs padre de cada corrida del DAG (`training-scheduled__…` y `training-manual__…`), con origen `airflow`; dentro de cada uno están los tres candidatos anidados.
+MLflow 3.16.1 en `mlflow.k8s.orb.local`, experimento `real-estate-pricing` con los runs padre de cada corrida del DAG (`training-scheduled__…` y `training-manual__…`), con origen `airflow`; dentro de cada uno están los tres candidatos anidados.
 
 ![Experimentos en MLflow](docs/images/7-mlflow-experiments.png)

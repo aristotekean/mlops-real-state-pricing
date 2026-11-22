@@ -117,3 +117,20 @@ def test_assign_split_is_deterministic_and_roughly_70_15_15():
     assert 0.67 < splits.count("train") / len(splits) < 0.73
     with pytest.raises(ValueError):
         assign_split(" ")
+
+
+def test_exclusion_reason_flags_implausible_values_only():
+    from real_estate_model.contract import exclusion_reason
+
+    assert exclusion_reason(source_record()) is None
+    assert exclusion_reason(source_record(price="515000000.0")) == "out_of_range_price"
+    assert (
+        exclusion_reason(source_record(bed="444.0", acre_lot="100000.0"))
+        == "out_of_range_bed;out_of_range_acre_lot"
+    )
+    # Missing optional values are not outliers.
+    assert exclusion_reason(source_record(house_size="")) is None
+    # Custom bounds replace the defaults.
+    assert exclusion_reason(source_record(), {"price": (200_000.0, None)}) == (
+        "out_of_range_price"
+    )

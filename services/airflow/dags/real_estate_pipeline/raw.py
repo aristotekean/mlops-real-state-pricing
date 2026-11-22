@@ -1,415 +1,309 @@
-"""Source file checks, incremental RAW ingestion, and RAW quality validation."""
+"""RAW layer: land each Data API response, then explode it into raw.records."""
 
-import csv
-import hashlib
-import itertools
+import gzip
 import json
+import math
+import time
 import uuid
-from collections import Counter
-from pathlib import Path
+from collections import defaultdict
 from typing import Any
 
-from airflow.sdk.exceptions import AirflowFailException
-from sqlalchemy import bindparam, text
+from sqlalchemy import text
 
-from real_estate_model.contract import ENCOUNTER_COLUMN, SOURCE_COLUMNS, validate_source_record
-from real_estate_pipeline.settings import (
-    DATASET_URL,
-    MAX_BATCH_SIZE,
-    MAX_REJECTED_FRACTION,
-    database_engine,
-)
+from real_estate_model.contract import record_key
+from real_estate_pipeline import history, settings
+from real_estate_pipeline.api_client import DataApiError, DataApiUnavailable, fetch_batch
+from real_estate_pipeline.db import copy_rows, engine_scope
 
-BATCH_NAMESPACE = uuid.UUID("81ef2d31-3813-4c32-a9c2-310b3bc590ef")
-DUPLICATE_ENCOUNTER = "duplicate_encounter_id"
+BATCH_NAMESPACE = uuid.UUID("5b0f8c51-6f0e-4a59-9a43-0d0c7c4f1e26")
 
-
-def ensure_dataset_available(path: Path) -> None:
-    """Download the workshop source into its persistent mount when absent."""
-    if path.is_file():
-        return
-    from scripts.download_real_estate_dataset import download_dataset
-
-    download_dataset(destination=path, url=DATASET_URL)
+BATCH_COLUMNS = """
+    batch_id::text AS batch_id, group_number, api_batch_number, record_count,
+    received_at::text AS received_at, dag_run_id, status, pipeline_status
+"""
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _json_type(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    return type(value).__name__
 
 
-def source_metadata(path: Path) -> dict[str, Any]:
-    """Validate the file's schema and row shape; row content is checked in RAW."""
-    if not path.is_file():
-        raise AirflowFailException(f"Dataset file is unavailable: {path}")
-    if path.stat().st_size == 0:
-        raise AirflowFailException(f"Dataset file is empty: {path}")
+def observed_schema(records: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Column -> sorted JSON types seen across every record of the response."""
+    types: dict[str, set[str]] = defaultdict(set)
+    for record in records:
+        for column, value in record.items():
+            types[column].add(_json_type(value))
+    return {column: sorted(kinds) for column, kinds in sorted(types.items())}
 
-    row_count = 0
-    with path.open("r", encoding="utf-8-sig", newline="") as source:
-        reader = csv.DictReader(source)
-        if reader.fieldnames is None:
-            raise AirflowFailException("Dataset CSV has no header.")
-        if len(reader.fieldnames) != len(set(reader.fieldnames)):
-            raise AirflowFailException("Dataset CSV has duplicate column names.")
-        missing_columns = set(SOURCE_COLUMNS).difference(reader.fieldnames)
-        extra_columns = set(reader.fieldnames).difference(SOURCE_COLUMNS)
-        if missing_columns or extra_columns:
-            raise AirflowFailException(
-                "Dataset schema mismatch. "
-                f"Missing columns: {sorted(missing_columns)}; "
-                f"unexpected columns: {sorted(extra_columns)}"
+
+def _log_request(connection: Any, **fields: Any) -> None:
+    """One raw.api_requests row per fetch attempt (every request is a data event)."""
+    row = {
+        "dag_run_id": None, "api_called": True, "request_url": None,
+        "group_number": settings.DATA_API_GROUP_NUMBER, "http_status": None, "duration_ms": None,
+        "outcome": None, "api_batch_number": None, "batch_id": None, "response_sha256": None,
+        "record_count": None, "detail": None,
+    } | fields
+    connection.execute(
+        text(
+            """
+            INSERT INTO raw.api_requests (
+                dag_run_id, api_called, request_url, group_number, http_status, duration_ms,
+                outcome, api_batch_number, batch_id, response_sha256, record_count, detail
             )
-        for row_number, row in enumerate(reader, start=1):
-            if None in row or any(value is None for value in row.values()):
-                raise AirflowFailException(
-                    f"CSV row {row_number} does not have one value per column."
-                )
-            row_count += 1
-
-    if row_count == 0:
-        raise AirflowFailException("Dataset CSV contains no data rows.")
-    return {
-        "path": str(path),
-        "source_file": path.name,
-        "source_uri": DATASET_URL,
-        "source_sha256": _sha256_file(path),
-        "row_count": row_count,
-        "total_batches": (row_count + MAX_BATCH_SIZE - 1) // MAX_BATCH_SIZE,
-    }
-
-
-def _hash_record(record: dict[str, str]) -> str:
-    canonical_record = json.dumps(
-        record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            VALUES (
+                :dag_run_id, :api_called, :request_url, :group_number, :http_status, :duration_ms,
+                :outcome, :api_batch_number, :batch_id, :response_sha256, :record_count, :detail
+            )
+            """
+        ),
+        row,
     )
-    return hashlib.sha256(canonical_record.encode("utf-8")).hexdigest()
 
 
-def ingest_next_batch(source: dict[str, Any], dag_run_id: str) -> dict[str, Any]:
-    """Load the first batch of this source snapshot that is not completed yet.
+def _context(row: Any, outcome: str, **extra: Any) -> dict[str, Any]:
+    return {"outcome": outcome, **dict(row), **extra}
 
-    One batch per DAG run simulates incremental arrival. A batch left
-    ``loading`` or ``failed`` by an earlier run is resumed before a new one.
+
+def fetch_and_land(dag_run_id: str) -> dict[str, Any]:
+    """fetch_batch_from_api: get ONE new batch and persist the response first.
+
+    1. A batch left unfinished by an earlier run is resumed instead of calling
+       the API: the API is stateful and that batch can never be requested again.
+    2. Otherwise GET /data once. The body is stored gzip-compressed in
+       raw.batches before any processing, so a later failure loses nothing.
+    3. A response identical to one already landed (same group, API batch
+       number and SHA-256) is a duplicate and is not reprocessed.
     """
-    engine = database_engine()
-    try:
-        with engine.connect() as connection:
-            completed = set(
-                connection.execute(
-                    text(
-                        """
-                        SELECT batch_number FROM raw.load_batches
-                        WHERE source_sha256 = :source_sha256 AND status = 'completed'
-                        """
-                    ),
-                    {"source_sha256": source["source_sha256"]},
-                ).scalars()
-            )
-        pending = [
-            number
-            for number in range(1, source["total_batches"] + 1)
-            if number not in completed
-        ]
-        if not pending:
-            return {"batch_number": None, "inserted_rows": 0, "pending_batches": 0}
-
-        batch_number = pending[0]
-        first_row_number = (batch_number - 1) * MAX_BATCH_SIZE + 1
-        with Path(source["path"]).open("r", encoding="utf-8-sig", newline="") as dataset:
-            rows = list(
-                itertools.islice(
-                    csv.DictReader(dataset),
-                    first_row_number - 1,
-                    first_row_number - 1 + MAX_BATCH_SIZE,
-                )
-            )
-        inserted_rows = _insert_raw_batch(
-            engine,
-            source=source,
-            batch_number=batch_number,
-            first_row_number=first_row_number,
-            rows=rows,
-            dag_run_id=dag_run_id,
-        )
-    finally:
-        engine.dispose()
-
-    return {
-        "batch_number": batch_number,
-        "first_row_number": first_row_number,
-        "record_count": len(rows),
-        "inserted_rows": inserted_rows,
-        "pending_batches": len(pending) - 1,
-    }
-
-
-def _insert_raw_batch(
-    engine: Any,
-    *,
-    source: dict[str, Any],
-    batch_number: int,
-    first_row_number: int,
-    rows: list[dict[str, str]],
-    dag_run_id: str,
-) -> int:
-    """Persist or resume one atomic, idempotent raw batch."""
-    batch_id = uuid.uuid5(BATCH_NAMESPACE, f"{source['source_sha256']}:{batch_number}")
-    batch_size = len(rows)
-    if not 1 <= batch_size <= MAX_BATCH_SIZE:
-        raise ValueError(f"Invalid raw batch size: {batch_size}")
-
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                """
-                INSERT INTO raw.load_batches (
-                    batch_id, source_file, source_uri, source_sha256,
-                    batch_number, expected_record_count, status, dag_run_id
-                )
-                VALUES (
-                    :batch_id, :source_file, :source_uri, :source_sha256,
-                    :batch_number, :expected_record_count, 'loading', :dag_run_id
-                )
-                ON CONFLICT (source_sha256, batch_number) DO NOTHING
-                """
-            ),
-            {
-                "batch_id": batch_id,
-                "source_file": source["source_file"],
-                "source_uri": source["source_uri"],
-                "source_sha256": source["source_sha256"],
-                "batch_number": batch_number,
-                "expected_record_count": batch_size,
-                "dag_run_id": dag_run_id,
-            },
-        )
-        batch = connection.execute(
-            text(
-                """
-                SELECT batch_id, expected_record_count, loaded_record_count, status
-                FROM raw.load_batches
-                WHERE source_sha256 = :source_sha256 AND batch_number = :batch_number
-                FOR UPDATE
-                """
-            ),
-            {"source_sha256": source["source_sha256"], "batch_number": batch_number},
-        ).mappings().one()
-        if batch["batch_id"] != batch_id or batch["expected_record_count"] != batch_size:
-            raise RuntimeError(
-                f"Existing batch {batch_number} metadata conflicts with this source."
-            )
-        if batch["status"] == "completed":
-            if batch["loaded_record_count"] != batch_size:
-                raise RuntimeError(
-                    f"Completed batch {batch_number} has an invalid record count."
-                )
-            return 0
-        connection.execute(
-            text(
-                """
-                UPDATE raw.load_batches
-                SET status = 'loading', completed_at = NULL, error_message = NULL,
-                    dag_run_id = :dag_run_id
-                WHERE batch_id = :batch_id
-                """
-            ),
-            {"batch_id": batch_id, "dag_run_id": dag_run_id},
-        )
-
-    record_values = [
-        {
-            "batch_id": batch_id,
-            "source_sha256": source["source_sha256"],
-            "source_row_number": first_row_number + offset,
-            "source_record_sha256": _hash_record(record),
-            "encounter_id": record[ENCOUNTER_COLUMN],
-            "record_data": json.dumps(record, ensure_ascii=False),
-        }
-        for offset, record in enumerate(rows)
-    ]
-    try:
+    with engine_scope() as engine:
         with engine.begin() as connection:
-            connection.execute(
+            pending = connection.execute(
+                text(
+                    f"""
+                    SELECT {BATCH_COLUMNS} FROM raw.batches
+                    WHERE pipeline_status <> 'completed'
+                    ORDER BY received_at LIMIT 1
+                    """
+                )
+            ).mappings().first()
+            if pending is not None:
+                connection.execute(
+                    text("UPDATE raw.batches SET dag_run_id = :run, pipeline_status = 'in_progress' WHERE batch_id = :id"),
+                    {"run": dag_run_id, "id": pending["batch_id"]},
+                )
+                history.start_batch(
+                    connection,
+                    {
+                        "batch_id": pending["batch_id"],
+                        "group_number": pending["group_number"],
+                        "api_batch_number": pending["api_batch_number"],
+                        "dag_run_id": dag_run_id,
+                        "record_count": pending["record_count"],
+                        "received_at": pending["received_at"],
+                    },
+                )
+                _log_request(
+                    connection, dag_run_id=dag_run_id, api_called=False, outcome="resumed",
+                    api_batch_number=pending["api_batch_number"], batch_id=pending["batch_id"],
+                    record_count=pending["record_count"],
+                    detail=f"previous pipeline_status={pending['pipeline_status']}",
+                )
+                print(
+                    f"Resuming unfinished batch {pending['api_batch_number']} "
+                    f"({pending['batch_id']}, previous status {pending['pipeline_status']}); "
+                    "the Data API is not called in this run."
+                )
+                return _context(pending, "resumed", dag_run_id=dag_run_id)
+
+        started = time.perf_counter()
+        try:
+            result = fetch_batch()
+        except (DataApiError, DataApiUnavailable) as exc:
+            with engine.begin() as connection:
+                _log_request(
+                    connection, dag_run_id=dag_run_id, outcome="error",
+                    request_url=f"{settings.DATA_API_URL}/data",
+                    duration_ms=(time.perf_counter() - started) * 1000, detail=str(exc)[:4000],
+                )
+            raise
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        request_log = {
+            "dag_run_id": dag_run_id, "request_url": result.request_url,
+            "http_status": result.http_status, "duration_ms": elapsed_ms,
+            "api_batch_number": result.api_batch_number,
+        }
+        if result.kind in ("end_of_data", "empty"):
+            with engine.begin() as connection:
+                _log_request(connection, **request_log, outcome=result.kind,
+                             record_count=0 if result.kind == "empty" else None, detail=result.detail)
+            if result.kind == "end_of_data":
+                print(f"Data API reports end of data: {result.detail}")
+                return {"outcome": "end_of_data", "detail": result.detail}
+            print(f"Data API returned batch {result.api_batch_number} with no rows.")
+            return {"outcome": "empty", "api_batch_number": result.api_batch_number}
+
+        sha256 = result.sha256
+        batch_id = str(
+            uuid.uuid5(BATCH_NAMESPACE, f"{result.group_number}:{result.api_batch_number}:{sha256}")
+        )
+        schema = observed_schema(result.records)
+        with engine.begin() as connection:
+            previous = connection.execute(
+                text("SELECT MAX(api_batch_number) FROM raw.batches WHERE group_number = :group"),
+                {"group": result.group_number},
+            ).scalar_one()
+            inserted = connection.execute(
                 text(
                     """
-                    INSERT INTO raw.records (
-                        batch_id, source_sha256, source_row_number,
-                        source_record_sha256, encounter_id, record_data
+                    INSERT INTO raw.batches (
+                        batch_id, group_number, api_batch_number, request_url,
+                        http_status, response_sha256, response_bytes, payload_gzip,
+                        record_count, received_schema, dag_run_id
                     )
                     VALUES (
-                        :batch_id, :source_sha256, :source_row_number,
-                        :source_record_sha256, :encounter_id,
-                        CAST(:record_data AS jsonb)
+                        :batch_id, :group_number, :api_batch_number, :request_url,
+                        :http_status, :sha256, :response_bytes, :payload_gzip,
+                        :record_count, CAST(:received_schema AS jsonb), :dag_run_id
                     )
-                    ON CONFLICT (source_sha256, source_row_number) DO NOTHING
-                    """
-                ),
-                record_values,
-            )
-            loaded_count = connection.execute(
-                text(
-                    """
-                    SELECT COUNT(*)
-                    FROM raw.records
-                    WHERE source_sha256 = :source_sha256
-                      AND source_row_number BETWEEN :first_row_number AND :last_row_number
+                    ON CONFLICT (group_number, api_batch_number, response_sha256) DO NOTHING
+                    RETURNING batch_id
                     """
                 ),
                 {
-                    "source_sha256": source["source_sha256"],
-                    "first_row_number": first_row_number,
-                    "last_row_number": first_row_number + batch_size - 1,
+                    "batch_id": batch_id,
+                    "group_number": result.group_number,
+                    "api_batch_number": result.api_batch_number,
+                    "request_url": result.request_url,
+                    "http_status": result.http_status,
+                    "sha256": sha256,
+                    "response_bytes": len(result.body),
+                    "payload_gzip": gzip.compress(result.body, compresslevel=6),
+                    "record_count": len(result.records),
+                    "received_schema": json.dumps(schema),
+                    "dag_run_id": dag_run_id,
                 },
-            ).scalar_one()
-            if loaded_count != batch_size:
-                raise RuntimeError(
-                    f"Batch {batch_number} expected {batch_size} raw records, "
-                    f"found {loaded_count}."
+            ).first()
+            request_log |= {"batch_id": batch_id, "response_sha256": sha256,
+                            "record_count": len(result.records)}
+            if inserted is None:
+                _log_request(connection, **request_log, outcome="duplicate",
+                             detail="same group, API batch number and SHA-256 as an ingested batch")
+                print(
+                    f"Duplicate response: API batch {result.api_batch_number} with SHA-256 "
+                    f"{sha256[:12]} was already ingested; it is not reprocessed."
                 )
-            connection.execute(
-                text(
-                    """
-                    UPDATE raw.load_batches
-                    SET loaded_record_count = :loaded_record_count,
-                        status = 'completed',
-                        completed_at = CURRENT_TIMESTAMP,
-                        error_message = NULL
-                    WHERE batch_id = :batch_id
-                    """
-                ),
-                {"batch_id": batch_id, "loaded_record_count": loaded_count},
-            )
-    except Exception as exc:
-        with engine.begin() as connection:
-            connection.execute(
-                text(
-                    """
-                    UPDATE raw.load_batches
-                    SET status = 'failed', completed_at = NULL, error_message = :error
-                    WHERE batch_id = :batch_id
-                    """
-                ),
-                {"batch_id": batch_id, "error": str(exc)[:4000]},
-            )
-        raise
-    return batch_size
-
-
-def validate_raw_records() -> dict[str, Any]:
-    """Mark every ``loaded`` RAW record as ``validated`` or ``rejected``.
-
-    Rejections keep their reasons in ``status_reason``. An encounter already
-    validated earlier (or earlier in the same chunk) is rejected as a duplicate,
-    so CLEAN never receives the same encounter twice. Afterwards, any batch whose
-    rejected share exceeds ``MAX_REJECTED_FRACTION`` fails the task; because the
-    statuses are persisted, the gate keeps failing on retries until the data is
-    investigated.
-    """
-    select_loaded = text(
-        """
-        SELECT raw_record_id, encounter_id, record_data
-        FROM raw.records
-        WHERE status = 'loaded'
-        ORDER BY raw_record_id
-        LIMIT :limit
-        """
-    )
-    find_validated = text(
-        """
-        SELECT encounter_id FROM raw.records
-        WHERE status = 'validated' AND encounter_id IN :encounter_ids
-        """
-    ).bindparams(bindparam("encounter_ids", expanding=True))
-    update_status = text(
-        """
-        UPDATE raw.records
-        SET status = :status, status_reason = :status_reason,
-            validated_at = CURRENT_TIMESTAMP
-        WHERE raw_record_id = :raw_record_id
-        """
-    )
-    reasons: Counter[str] = Counter()
-    validated = rejected = 0
-    engine = database_engine()
-    try:
-        while True:
-            with engine.begin() as connection:
-                rows = connection.execute(
-                    select_loaded, {"limit": MAX_BATCH_SIZE}
-                ).mappings().all()
-                if not rows:
-                    break
-                seen = set(
-                    connection.execute(
-                        find_validated,
-                        {"encounter_ids": [row["encounter_id"] for row in rows]},
-                    ).scalars()
-                )
-                updates = []
-                for row in rows:
-                    errors = validate_source_record(row["record_data"])
-                    if row["encounter_id"] in seen:
-                        errors.append(DUPLICATE_ENCOUNTER)
-                    reasons.update(errors)
-                    if errors:
-                        rejected += 1
-                    else:
-                        validated += 1
-                        seen.add(row["encounter_id"])
-                    updates.append(
-                        {
-                            "raw_record_id": row["raw_record_id"],
-                            "status": "rejected" if errors else "validated",
-                            "status_reason": "; ".join(errors) or None,
-                        }
-                    )
-                connection.execute(update_status, updates)
-
-        with engine.connect() as connection:
-            failing_batches = connection.execute(
-                text(
-                    """
-                    SELECT b.batch_number, b.source_sha256,
-                           COUNT(*) AS total_rows,
-                           COUNT(*) FILTER (WHERE r.status = 'rejected') AS rejected_rows
-                    FROM raw.records r
-                    JOIN raw.load_batches b ON b.batch_id = r.batch_id
-                    GROUP BY b.batch_number, b.source_sha256
-                    HAVING COUNT(*) FILTER (WHERE r.status = 'rejected')
-                        > :max_fraction * COUNT(*)
-                    """
-                ),
-                {"max_fraction": MAX_REJECTED_FRACTION},
-            ).mappings().all()
-            totals = connection.execute(
-                text(
-                    """
-                    SELECT COUNT(*) FILTER (WHERE status = 'validated') AS validated,
-                           COUNT(*) FILTER (WHERE status = 'rejected') AS rejected
-                    FROM raw.records
-                    """
-                )
+                return {
+                    "outcome": "duplicate",
+                    "api_batch_number": result.api_batch_number,
+                    "batch_id": batch_id,
+                }
+            row = connection.execute(
+                text(f"SELECT {BATCH_COLUMNS} FROM raw.batches WHERE batch_id = :id"),
+                {"id": batch_id},
             ).mappings().one()
-    finally:
-        engine.dispose()
+            _log_request(connection, **request_log, outcome="new")
+            history.start_batch(
+                connection,
+                {
+                    "batch_id": batch_id,
+                    "group_number": row["group_number"],
+                    "api_batch_number": row["api_batch_number"],
+                    "dag_run_id": dag_run_id,
+                    "record_count": row["record_count"],
+                    "received_at": row["received_at"],
+                },
+            )
 
-    if failing_batches:
-        details = ", ".join(
-            f"batch {row['batch_number']} ({row['rejected_rows']}/{row['total_rows']})"
-            for row in failing_batches
-        )
-        raise AirflowFailException(
-            f"RAW quality gate failed: rejected share above {MAX_REJECTED_FRACTION:.2%} "
-            f"in {details}. Inspect raw.records.status_reason."
-        )
+    # The API hands out batches in order; a jump means a response was lost
+    # (e.g. a timeout after the server had already advanced its counter).
+    expected = 0 if previous is None else previous + 1
+    gap = list(range(expected, result.api_batch_number)) if result.api_batch_number > expected else []
+    print(
+        f"Landed API batch {result.api_batch_number}: {len(result.records)} rows, "
+        f"{len(result.body) / 1e6:.1f} MB, sha256 {sha256[:12]}"
+        + (f"; WARNING missing API batches {gap}" if gap else "")
+    )
+    return _context(row, "new", dag_run_id=dag_run_id, missing_api_batches=gap)
+
+
+def load_payload(batch_id: str) -> list[dict[str, Any]]:
+    """Decompress and parse the landed response of a batch."""
+    with engine_scope() as engine, engine.connect() as connection:
+        payload = connection.execute(
+            text("SELECT payload_gzip FROM raw.batches WHERE batch_id = :id"),
+            {"id": batch_id},
+        ).scalar_one()
+    return json.loads(gzip.decompress(bytes(payload)))["data"]
+
+
+def _jsonb_safe(record: dict[str, Any]) -> dict[str, Any]:
+    """jsonb cannot hold NaN/Infinity: those (non-standard JSON) become null."""
     return {
-        "validated_rows": validated,
-        "rejected_rows": rejected,
-        "rejection_reasons": dict(reasons),
-        "total_validated_rows": totals["validated"],
-        "total_rejected_rows": totals["rejected"],
+        key: None if isinstance(value, float) and not math.isfinite(value) else value
+        for key, value in record.items()
     }
+
+
+def store_raw_batch(batch: dict[str, Any]) -> dict[str, Any]:
+    """store_raw_batch: one raw.records row per listing, exactly as received.
+
+    Idempotent: a batch already stored is left untouched; a partial load is
+    replaced inside a single transaction.
+    """
+    batch_id = batch["batch_id"]
+    with engine_scope() as engine:
+        with engine.connect() as connection:
+            stored = connection.execute(
+                text("SELECT COUNT(*) FROM raw.records WHERE batch_id = :id"),
+                {"id": batch_id},
+            ).scalar_one()
+        if stored == batch["record_count"]:
+            print(f"Batch {batch['api_batch_number']} already stored ({stored} rows).")
+            return {"stored_rows": stored, "already_stored": True}
+
+        records = load_payload(batch_id)
+        if len(records) != batch["record_count"]:
+            raise RuntimeError(
+                f"Landed payload has {len(records)} rows, raw.batches says {batch['record_count']}."
+            )
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    text("DELETE FROM raw.records WHERE batch_id = :id"), {"id": batch_id}
+                )
+                copy_rows(
+                    connection,
+                    "raw.records",
+                    ("batch_id", "row_number", "record_key", "record_data"),
+                    (
+                        (batch_id, number, record_key(record), _jsonb_safe(record))
+                        for number, record in enumerate(records, start=1)
+                    ),
+                )
+                connection.execute(
+                    text(
+                        """
+                        UPDATE raw.batches
+                        SET status = 'stored', stored_at = CURRENT_TIMESTAMP, error_message = NULL
+                        WHERE batch_id = :id
+                        """
+                    ),
+                    {"id": batch_id},
+                )
+        except Exception as exc:
+            with engine.begin() as connection:
+                connection.execute(
+                    text("UPDATE raw.batches SET status = 'failed', error_message = :error WHERE batch_id = :id"),
+                    {"id": batch_id, "error": str(exc)[:4000]},
+                )
+            raise
+    print(f"Stored {len(records)} RAW records of API batch {batch['api_batch_number']}.")
+    return {"stored_rows": len(records), "already_stored": False}

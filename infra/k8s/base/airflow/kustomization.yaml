@@ -4,8 +4,9 @@
 # UI / REST API is reached as `airflow-apiserver` on port 8080 (same hostname as
 # in services/airflow/compose.yml).
 #
-# DAGs and the `scripts` package are baked into the image
-# (services/airflow/Dockerfile), so there is no ConfigMap for dags/config/plugins.
+# DAGs are baked into the image (services/airflow/Dockerfile), so there is no
+# ConfigMap for dags/config/plugins. The data comes from the Data API
+# (base/data-api) one batch per DAG run; nothing is stored on a local volume.
 # The metadata database lives in base/postgres-airflow; the training database
 # (postgres-train), MLflow and RustFS come from the other bases.
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -19,8 +20,8 @@ resources:
 
 # `airflow-env`: non-secret environment attached with `envFrom` to the init Job
 # and to the four Airflow containers. The fixed Airflow settings live here; the
-# deployment-specific values (TRAIN_DB_HOST/PORT, dataset path and URI, MLflow
-# experiment, model name and alias, REAL_ESTATE_TRAINING_SCHEDULE) are merged in
+# deployment-specific values (TRAIN_DB_HOST/PORT, MLflow experiment, model
+# name and alias, REAL_ESTATE_TRAINING_SCHEDULE) are merged in
 # from .env by infra/k8s/settings. Secrets (`airflow-secrets`,
 # `airflow-admin-user`, `postgres-train-credentials`) and the MLflow/RustFS
 # client settings (`mlflow-client-env`, `rustfs-credentials`) come from .env too
@@ -40,3 +41,57 @@ configMapGenerator:
       - AIRFLOW__CORE__EXECUTION_API_SERVER_URL=http://localhost:8080/execution/
       # Lets /api/v2/monitor/health report the scheduler heartbeat.
       - AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK=true
+
+  # `pipeline-config`: every tunable of the real_estate_incremental_training
+  # DAG (services/airflow/dags/real_estate_pipeline/settings.py, explained in
+  # docs/pipeline.md). Kept here, in Git, on purpose: changing a threshold is a
+  # reviewed, versioned change that Argo CD syncs, and the configMapGenerator
+  # hash in the name rolls the Airflow pod so the new values take effect.
+  - name: pipeline-config
+    literals:
+      # --- Data API (base/data-api) ---
+      - DATA_API_URL=http://data-api:80
+      - DATA_API_GROUP_NUMBER=6
+      - DATA_API_DAY=
+      - DATA_API_CONNECT_TIMEOUT_SECONDS=10
+      - DATA_API_READ_TIMEOUT_SECONDS=300
+      - DATA_API_MAX_ATTEMPTS=4
+      - DATA_API_BACKOFF_SECONDS=5
+      # --- Validation ---
+      - MAX_REJECTED_FRACTION=0.05
+      - 'TRAINING_BOUNDS_JSON={"price": [10000, 20000000], "bed": [null, 20], "bath": [null, 20], "house_size": [100, 30000], "acre_lot": [null, 1000]}'
+      - NEW_CATEGORY_COLUMNS=status,state,city
+      - NEW_CATEGORY_MIN_SHARE=0.01
+      - DRIFT_FEATURES=price,house_size,bed,bath,acre_lot,state,status
+      - DRIFT_PSI_THRESHOLD=0.20
+      - DRIFT_BINS=10
+      # --- Training decision ---
+      - MIN_BATCH_ROWS=5000
+      - MIN_VOLUME_GROWTH=0.20
+      - DEGRADATION_METRIC=rmsle
+      - DEGRADATION_THRESHOLD=0.10
+      - DEGRADATION_SAMPLE_ROWS=20000
+      - MIN_TRAIN_ROWS=1000
+      - MIN_EVALUATION_ROWS=200
+      # --- Training ---
+      # HistGradientBoosting won every batch; Ridge stays as a cheap linear
+      # baseline (a sanity check: it should never beat the boosted model).
+      # random_forest is still available in real_estate_model but not trained:
+      # it never won and its models are ~10x larger in RustFS (~31 MB each).
+      - TRAINING_CANDIDATES=ridge,hist_gradient_boosting
+      # Upper bound of train rows (deterministic sample beyond it) so memory
+      # and training time stay bounded as batches accumulate. Group 6 has
+      # ~760k train rows, below the cap; the scheduler limit is 4Gi.
+      - TRAINING_MAX_ROWS=1000000
+      - IMPORTANCE_SAMPLE_ROWS=5000
+      # --- Selection and promotion ---
+      - PRIMARY_METRIC=mae
+      - GUARD_METRIC=rmse
+      - PROMOTION_MIN_IMPROVEMENT=0.03
+      - PROMOTION_MAX_GUARD_DEGRADATION=0.01
+      # --- MLflow client ---
+      # The client's default (7 retries, exponential backoff) keeps a task
+      # blocked for minutes when MLflow is down; fail sooner and let the
+      # Airflow task retries (with their own backoff) handle the outage.
+      - MLFLOW_HTTP_REQUEST_MAX_RETRIES=3
+      - MLFLOW_HTTP_REQUEST_TIMEOUT=60

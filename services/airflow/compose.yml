@@ -35,8 +35,11 @@ x-airflow-common: &airflow-common
     TRAIN_DB_NAME: ${TRAIN_DB_NAME:?}
     TRAIN_DB_USER: ${TRAIN_DB_USER:?}
     TRAIN_DB_PASSWORD: ${TRAIN_DB_PASSWORD:?}
-    REAL_ESTATE_DATASET_PATH: ${REAL_ESTATE_DATASET_PATH:?}
-    REAL_ESTATE_SOURCE_URI: ${REAL_ESTATE_SOURCE_URI:?}
+    # Data API (the `data-api` service below). The remaining pipeline
+    # thresholds use the defaults of real_estate_pipeline/settings.py; in
+    # Kubernetes they come from the pipeline-config ConfigMap.
+    DATA_API_URL: http://data-api:80
+    DATA_API_GROUP_NUMBER: "6"
     # S2 · MLflow tracking server (artifacts proxied by the server)
     MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:?}
     MLFLOW_EXPERIMENT_NAME: ${MLFLOW_EXPERIMENT_NAME:?}
@@ -45,15 +48,13 @@ x-airflow-common: &airflow-common
     AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY:?}
     MODEL_NAME: ${MODEL_NAME:?}
     MODEL_ALIAS: ${MODEL_ALIAS:?}
-    # Each run loads the next RAW batch, so a short interval replays the
-    # incremental arrival of the 7 batches in about an hour.
+    # Each run requests the next batch from the Data API.
     REAL_ESTATE_TRAINING_SCHEDULE: ${REAL_ESTATE_TRAINING_SCHEDULE:?}
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
     - ./config:/opt/airflow/config
-    - ../../data/RealEstate:/opt/airflow/data/RealEstate
   # On Linux bind mounts keep the host's ownership, so the Airflow user must be
   # the host user (AIRFLOW_UID=$(id -u) in .env) to write logs and download the
   # dataset. Docker Desktop/OrbStack on macOS map ownership, so 50000 works.
@@ -67,6 +68,23 @@ x-airflow-common: &airflow-common
       condition: service_completed_successfully
 
 services:
+  # ------------------------------------------------------------------------- #
+  # Data API of the course (external source, one batch per GET /data)
+  # ------------------------------------------------------------------------- #
+  data-api:
+    image: cristiandiaz13/mlops-puj:data-api-pf-v2
+    platform: linux/amd64
+    container_name: real-estate-data-api
+    ports:
+      - "${DATA_API_PORT:-8090}:80"
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:80/health', timeout=4)" ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
   # ------------------------------------------------------------------------- #
   # S5 · PostgreSQL (training database)
   # ------------------------------------------------------------------------- #
@@ -138,8 +156,8 @@ services:
     command:
       - -c
       - |
-        mkdir -p /opt/airflow/{logs,dags,plugins,config,data/RealEstate}
-        chown -R "${AIRFLOW_UID:?}:0" /opt/airflow/{logs,dags,plugins,config,data/RealEstate}
+        mkdir -p /opt/airflow/{logs,dags,plugins,config}
+        chown -R "${AIRFLOW_UID:?}:0" /opt/airflow/{logs,dags,plugins,config}
         exec /entrypoint airflow version
     environment:
       <<: *airflow-common-env

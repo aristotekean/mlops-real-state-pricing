@@ -1,0 +1,6 @@
+# Unit tests of the pipeline logic (no Airflow, database or MLflow needed):
+#   uv run --no-project --with-requirements services/airflow/tests/requirements.txt \
+#     --with-editable ml/real_estate_model python -m pytest services/airflow/tests
+pytest
+requests
+sqlalchemy>=2

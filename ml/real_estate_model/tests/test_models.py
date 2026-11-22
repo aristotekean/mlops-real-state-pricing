@@ -104,3 +104,23 @@ def test_offline_training_from_csv(tmp_path):
 
     results = train_candidates(data, ("ridge",))
     assert {"train_rmsle", "validation_rmsle", "test_rmsle"} <= set(results["ridge"][1])
+
+
+def test_metric_directions_and_relative_improvement():
+    from real_estate_model.models import metric_greater_is_better, relative_improvement
+
+    assert not metric_greater_is_better("validation_mae")
+    assert metric_greater_is_better("r2")
+    # MAE 100 -> 94 is a 6% improvement; RMSE 100 -> 101 a 1% degradation.
+    assert relative_improvement(94.0, 100.0, "mae") == pytest.approx(0.06)
+    assert relative_improvement(101.0, 100.0, "validation_rmse") == pytest.approx(-0.01)
+    assert relative_improvement(0.8, 0.5, "r2") == pytest.approx(0.6)
+    with pytest.raises(ValueError):
+        metric_greater_is_better("accuracy")
+
+
+def test_extreme_inputs_never_produce_infinite_prices():
+    candidate = build_candidate("ridge").fit(FEATURES, PRICES)
+    serving = build_serving_pipeline(candidate)
+    extreme = input_frame([source_record(house_size="1560780.0", acre_lot="100000.0", bed="444.0")])
+    assert np.isfinite(serving.predict(extreme)).all()

@@ -2,7 +2,7 @@
 # dag-processor, triggerer) as ONE pod. Decision for this stack: with the
 # LocalExecutor the tasks run inside the scheduler container and the api-server
 # serves their log files from disk, so the two must share /opt/airflow/logs;
-# one pod with an emptyDir does that without a shared-storage volume.
+# one pod with a ReadWriteOnce PVC does that without a shared-storage volume.
 #
 # Every container is started by the image ENTRYPOINT (dumb-init + /entrypoint),
 # which runs `airflow <args>`; the environment is the common compose block split
@@ -32,7 +32,7 @@ spec:
         app.kubernetes.io/name: airflow
     spec:
       # Same identity as compose (`user: 50000:0`); fsGroup 0 makes the
-      # emptyDir and the dataset volume group-writable for that gid, which
+      # logs volume group-writable for that gid, which
       # replaces the chown the compose init container does on bind mounts.
       securityContext:
         runAsNonRoot: true
@@ -133,6 +133,10 @@ spec:
             # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY for the artifact store.
             - secretRef:
                 name: rustfs-credentials
+            # Data API endpoint, validation/decision thresholds and promotion
+            # rule of the DAG (versioned in base/airflow/kustomization.yaml).
+            - configMapRef:
+                name: pipeline-config
           env:
             # S5 training database identity, from the same Secret api-inference
             # uses (host/port are plain config in `airflow-env`).
@@ -157,8 +161,6 @@ spec:
           volumeMounts:
             - name: airflow-logs
               mountPath: /opt/airflow/logs
-            - name: airflow-dataset
-              mountPath: /opt/airflow/data/RealEstate
           resources:
             requests:
               cpu: 250m
@@ -189,7 +191,8 @@ spec:
             timeoutSeconds: 10
             failureThreshold: 5
         # Schedules DAG runs and, with the LocalExecutor, runs the tasks in
-        # subprocesses: training happens here, hence the larger limits.
+        # subprocesses: ingestion of large batches and training happen here,
+        # hence the larger limits.
         - name: scheduler
           image: aristotekean/real-estate-airflow
           imagePullPolicy: IfNotPresent
@@ -203,6 +206,8 @@ spec:
                 name: mlflow-client-env
             - secretRef:
                 name: rustfs-credentials
+            - configMapRef:
+                name: pipeline-config
           env:
             # S5 training database identity, from the same Secret api-inference
             # uses (host/port are plain config in `airflow-env`).
@@ -224,15 +229,16 @@ spec:
           volumeMounts:
             - name: airflow-logs
               mountPath: /opt/airflow/logs
-            - name: airflow-dataset
-              mountPath: /opt/airflow/data/RealEstate
+          # Sized for the group-6 data: training on ~1.1 M accumulated rows
+          # peaks at ~2.5 GB (pandas frames + three candidates fitted in
+          # turn), plus the scheduler process itself.
           resources:
             requests:
               cpu: 500m
-              memory: 1Gi
+              memory: 1536Mi
             limits:
-              cpu: "1"
-              memory: 2Gi
+              cpu: "2"
+              memory: 4Gi
           # Same check as the compose healthcheck. `--local` matches the job
           # row by the hostname Airflow itself recorded (hostname_callable), so
           # it does not depend on how $HOSTNAME is spelled; all four containers
@@ -264,6 +270,8 @@ spec:
                 name: mlflow-client-env
             - secretRef:
                 name: rustfs-credentials
+            - configMapRef:
+                name: pipeline-config
           env:
             # S5 training database identity, from the same Secret api-inference
             # uses (host/port are plain config in `airflow-env`).
@@ -285,8 +293,6 @@ spec:
           volumeMounts:
             - name: airflow-logs
               mountPath: /opt/airflow/logs
-            - name: airflow-dataset
-              mountPath: /opt/airflow/data/RealEstate
           # The exec liveness probe below runs the Airflow CLI inside this
           # cgroup: importing Airflow costs a few hundred MB on top of the
           # process itself, so the limit leaves headroom for both (requests
@@ -323,6 +329,8 @@ spec:
                 name: mlflow-client-env
             - secretRef:
                 name: rustfs-credentials
+            - configMapRef:
+                name: pipeline-config
           env:
             # S5 training database identity, from the same Secret api-inference
             # uses (host/port are plain config in `airflow-env`).
@@ -344,8 +352,6 @@ spec:
           volumeMounts:
             - name: airflow-logs
               mountPath: /opt/airflow/logs
-            - name: airflow-dataset
-              mountPath: /opt/airflow/data/RealEstate
           # Same headroom as dag-processor for the exec CLI probe.
           resources:
             requests:
@@ -366,9 +372,7 @@ spec:
             failureThreshold: 5
       volumes:
         # Task logs written by the scheduler's task subprocesses and read by
-        # the api-server; lost with the pod, as the compose ./logs dir is not.
+        # the api-server; persistent so they survive restarts (pvc.yaml).
         - name: airflow-logs
-          emptyDir: {}
-        - name: airflow-dataset
           persistentVolumeClaim:
-            claimName: airflow-dataset
+            claimName: airflow-logs
