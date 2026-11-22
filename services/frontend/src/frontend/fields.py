@@ -1,8 +1,8 @@
-"""Form definition for the 44 inputs of the inference contract.
+"""Form definition for the real estate inference contract.
 
 The frontend talks to the API only, so it keeps its own copy of the field list
-(see docs/data-contract.md). Option lists come from the full dataset; the API
-remains the source of truth and rejects anything outside its contract.
+(see docs/data-contract.md). Option lists are a convenience; the API remains the
+source of truth and rejects anything outside its contract.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
-# Shown for categorical fields whose value can be missing; sent as JSON null.
+# Shown for categorical/text fields whose value can be missing; sent as JSON null.
 UNKNOWN = "(desconocido)"
 
 Kind = Literal["select", "number", "text"]
@@ -23,9 +23,11 @@ class Field:
     kind: Kind
     options: tuple[str, ...] = ()
     nullable: bool = False
-    min_value: int = 0
-    max_value: int = 0
+    min_value: float = 0.0
+    max_value: float = 0.0
     default: Any = None
+    # 0 => integer field; >0 => float field with this many decimals.
+    decimals: int = 0
     help: str | None = None
 
 
@@ -35,98 +37,59 @@ def _select(name: str, label: str, options: tuple[str, ...], *, nullable: bool =
                  default=default if default is not None else options[0], help=help)
 
 
-def _number(name: str, label: str, low: int, high: int, default: int,
-            help: str | None = None) -> Field:
-    return Field(name, label, "number", min_value=low, max_value=high, default=default, help=help)
+def _int(name: str, label: str, low: int, high: int, default: int,
+         help: str | None = None) -> Field:
+    return Field(name, label, "number", min_value=low, max_value=high,
+                 default=default, decimals=0, help=help)
 
 
-def _diagnosis(name: str, label: str, default: str | None) -> Field:
-    return Field(name, label, "text", nullable=True, default=default,
-                 help="Código ICD-9, p. ej. 428, 250.83 o V45. Vacío = desconocido.")
+def _float(name: str, label: str, low: float, high: float, default: float,
+           decimals: int = 2, help: str | None = None) -> Field:
+    return Field(name, label, "number", min_value=low, max_value=high,
+                 default=default, decimals=decimals, help=help)
 
 
-AGE_BUCKETS = tuple(f"[{low}-{low + 10})" for low in range(0, 100, 10))
-MEDICATION_DOSES = ("No", "Steady", "Up", "Down")
-ADMISSION_TYPE_IDS = ("1", "2", "3", "4", "5", "6", "7", "8")
-DISCHARGE_DISPOSITION_IDS = tuple(str(code) for code in range(1, 29) if code not in (21, 26))
-ADMISSION_SOURCE_IDS = tuple(
-    str(code) for code in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 17, 20, 22, 25)
-)
-PAYER_CODES = (
-    "MC", "HM", "SP", "BC", "MD", "CP", "UN", "CM", "OG", "PO", "DM", "CH", "WC", "OT",
-    "MP", "SI", "FR",
-)
-RACES = ("Caucasian", "AfricanAmerican", "Hispanic", "Asian", "Other")
-MEDICAL_SPECIALTIES = (
-    "InternalMedicine", "Emergency/Trauma", "Family/GeneralPractice", "Cardiology",
-    "Surgery-General", "Nephrology", "Orthopedics", "Orthopedics-Reconstructive",
-    "Radiologist", "Pulmonology", "Psychiatry", "Urology", "ObstetricsandGynecology",
-    "Surgery-Cardiovascular/Thoracic", "Gastroenterology", "Surgery-Vascular", "Surgery-Neuro",
-    "PhysicalMedicineandRehabilitation", "Oncology", "Pediatrics", "Hematology/Oncology",
-    "Neurology", "Pediatrics-Endocrinology", "Otolaryngology", "Endocrinology",
-    "Surgery-Thoracic", "Psychology", "Podiatry", "Surgery-Cardiovascular",
-    "Pediatrics-CriticalCare", "Hematology", "Gynecology", "Hospitalist", "Radiology",
-    "Surgeon", "Surgery-Plastic", "Osteopath", "Ophthalmology", "InfectiousDiseases",
-    "SurgicalSpecialty", "Obsterics&Gynecology-GynecologicOnco", "Pediatrics-Pulmonology",
-    "Anesthesiology-Pediatric", "Obstetrics", "Rheumatology", "Pathology", "Anesthesiology",
-    "OutreachServices", "Surgery-Colon&Rectal", "Surgery-Maxillofacial", "PhysicianNotFound",
-    "Pediatrics-Neurology", "Surgery-Pediatric", "Endocrinology-Metabolism",
-    "Psychiatry-Child/Adolescent", "AllergyandImmunology", "Cardiology-Pediatric", "DCPTEAM",
-    "Pediatrics-Hematology-Oncology", "Dentistry", "Pediatrics-EmergencyMedicine",
-    "Pediatrics-AllergyandImmunology", "Resident", "Surgery-PlasticwithinHeadandNeck",
-    "Pediatrics-InfectiousDiseases", "Psychiatry-Addictive", "Proctology", "Dermatology",
-    "SportsMedicine", "Speech", "Perinatology", "Neurophysiology",
-)
-MEDICATIONS = (
-    "metformin", "repaglinide", "nateglinide", "chlorpropamide", "glimepiride",
-    "acetohexamide", "glipizide", "glyburide", "tolbutamide", "pioglitazone",
-    "rosiglitazone", "acarbose", "miglitol", "troglitazone", "tolazamide", "insulin",
-    "glyburide-metformin", "glipizide-metformin", "glimepiride-pioglitazone",
-    "metformin-rosiglitazone", "metformin-pioglitazone",
+def _text(name: str, label: str, *, default: str | None = None,
+          help: str | None = None) -> Field:
+    return Field(name, label, "text", nullable=True, default=default, help=help)
+
+
+# Listing status observed in the source dataset. The target column `price` and
+# the identifier-like `street` are NOT model inputs and never appear here.
+STATUS_VALUES = ("for_sale", "ready_to_build", "sold")
+
+# US states and territories (the source is US real estate listings).
+US_STATES = (
+    "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado", "Connecticut",
+    "Delaware", "District of Columbia", "Florida", "Georgia", "Hawaii", "Idaho", "Illinois",
+    "Indiana", "Iowa", "Kansas", "Kentucky", "Louisiana", "Maine", "Maryland", "Massachusetts",
+    "Michigan", "Minnesota", "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada",
+    "New Hampshire", "New Jersey", "New Mexico", "New York", "North Carolina", "North Dakota",
+    "Ohio", "Oklahoma", "Oregon", "Pennsylvania", "Puerto Rico", "Rhode Island",
+    "South Carolina", "South Dakota", "Tennessee", "Texas", "Utah", "Vermont", "Virginia",
+    "Virgin Islands", "Washington", "West Virginia", "Wisconsin", "Wyoming",
 )
 
 SECTIONS: tuple[tuple[str, tuple[Field, ...]], ...] = (
-    ("Paciente", (
-        _select("race", "Raza", RACES, nullable=True),
-        _select("gender", "Género", ("Female", "Male", "Unknown/Invalid")),
-        _select("age", "Rango de edad", AGE_BUCKETS, default="[60-70)"),
-        _select("payer_code", "Código de pagador", PAYER_CODES, nullable=True, default="MC"),
+    ("Propiedad", (
+        _select("status", "Estado del listado", STATUS_VALUES,
+                help="for_sale = en venta, ready_to_build = lista para construir, sold = vendida."),
+        _int("bed", "Habitaciones", 0, 20, 3),
+        _int("bath", "Baños", 0, 20, 2),
+        _int("house_size", "Área habitable (sq ft)", 100, 30_000, 1_800),
+        _float("acre_lot", "Tamaño del terreno (acres)", 0.0, 1_000.0, 0.25, decimals=2),
     )),
-    ("Ingreso", (
-        _select("admission_type_id", "Tipo de ingreso (ID)", ADMISSION_TYPE_IDS,
-                help="1 = emergencia, 2 = urgencia, 3 = electivo."),
-        _select("admission_source_id", "Origen del ingreso (ID)", ADMISSION_SOURCE_IDS,
-                default="7", help="7 = sala de emergencias, 1 = remisión médica."),
-        _select("discharge_disposition_id", "Destino al alta (ID)", DISCHARGE_DISPOSITION_IDS,
-                help="1 = alta a casa. 11, 13, 14, 19 y 20 = fallecido u hospicio."),
-        _select("medical_specialty", "Especialidad que admite", MEDICAL_SPECIALTIES,
-                nullable=True),
-        _number("time_in_hospital", "Días de estancia", 1, 14, 4),
+    ("Ubicación", (
+        _text("city", "Ciudad", default="Austin"),
+        _select("state", "Estado", US_STATES, nullable=True, default="Texas"),
+        _text("zip_code", "Código postal (ZIP)", default="78701",
+              help="5 dígitos, p. ej. 78701. Vacío = desconocido."),
     )),
-    ("Uso de servicios el año anterior", (
-        _number("number_outpatient", "Visitas ambulatorias", 0, 100, 0),
-        _number("number_emergency", "Visitas a emergencias", 0, 100, 0),
-        _number("number_inpatient", "Hospitalizaciones", 0, 100, 0),
-    )),
-    ("Procedimientos y diagnósticos", (
-        _number("num_lab_procedures", "Pruebas de laboratorio", 0, 200, 44),
-        _number("num_procedures", "Procedimientos", 0, 20, 1),
-        _number("num_medications", "Medicamentos administrados", 0, 150, 15),
-        _number("number_diagnoses", "Número de diagnósticos", 0, 30, 8),
-        _diagnosis("diag_1", "Diagnóstico principal", "428"),
-        _diagnosis("diag_2", "Diagnóstico secundario", "250"),
-        _diagnosis("diag_3", "Diagnóstico adicional", None),
-    )),
-    ("Laboratorio", (
-        _select("max_glu_serum", "Glucosa sérica máxima", ("None", "Norm", ">200", ">300")),
-        _select("A1Cresult", "Resultado HbA1c", ("None", "Norm", ">7", ">8")),
-    )),
-    ("Medicamentos para la diabetes", tuple(
-        _select(name, name, MEDICATION_DOSES) for name in MEDICATIONS
-    )),
-    ("Tratamiento", (
-        _select("change", "Cambio de medicación", ("No", "Ch")),
-        _select("diabetesMed", "Recibe medicación para diabetes", ("Yes", "No")),
+    ("Metadatos", (
+        _text("brokered_by", "Agencia/corredor (código)", default="101",
+              help="Código numérico del corredor. Vacío = desconocido."),
+        _text("prev_sold_date", "Fecha de venta anterior", default=None,
+              help="Formato YYYY-MM-DD. Vacío = sin venta previa."),
     )),
 )
 
@@ -138,13 +101,17 @@ def default_values() -> dict[str, Any]:
     return {field.name: field.default for field in FIELDS}
 
 
+def _coerce_number(field: Field, value: Any) -> Any:
+    return float(value) if field.decimals > 0 else int(value)
+
+
 def to_widget_value(field: Field, value: Any) -> Any:
     """Map an API value (``None`` for missing) to what the widget displays."""
     if field.kind == "select":
         return UNKNOWN if value is None else value
     if field.kind == "text":
         return "" if value is None else str(value)
-    return int(value)
+    return _coerce_number(field, value)
 
 
 def from_widget_value(field: Field, value: Any) -> Any:
@@ -154,7 +121,7 @@ def from_widget_value(field: Field, value: Any) -> Any:
     if field.kind == "text":
         text = str(value).strip()
         return text or None
-    return int(value)
+    return _coerce_number(field, value)
 
 
 def widget_options(field: Field) -> list[str]:

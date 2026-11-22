@@ -1,10 +1,12 @@
 # Prometheus scrape configuration · Server C (observability)
 #
-# Scrapes the Inference API's /metrics endpoint and MinIO's
-# /minio/v2/metrics/cluster. Targets live in prometheus/targets/*.yml: by default
-# the Kubernetes Services (OrbStack resolves them from containers); in the local
-# compose stack use `api-inference:8000` / `minio:9000`; on a dedicated Server C,
-# Server A's address/port (see infra/monitoring/README.md).
+# Scrapes the Inference API's /metrics endpoint. The target lives in
+# prometheus/targets/api-targets.yml: by default the Kubernetes Service (OrbStack
+# resolves it from containers); in the local compose stack use `api-inference:8000`;
+# on a dedicated Server C, Server A's address/port (see infra/monitoring/README.md).
+#
+# The S3 artifact store is RustFS, which exposes no Prometheus metrics endpoint,
+# so there is no artifact-store scrape job (unlike a MinIO-based setup).
 
 global:
   scrape_interval: 15s
@@ -23,16 +25,6 @@ scrape_configs:
     metrics_path: /metrics
     file_sd_configs:
       - files: ["/etc/prometheus/targets/api-targets.yml"]
-
-  # MinIO (S3 artifact store). MinIO publishes Prometheus metrics on its S3
-  # port under /minio/v2/metrics/cluster; the server runs with
-  # MINIO_PROMETHEUS_AUTH_TYPE=public so no bearer token is needed. The target
-  # lives in prometheus/targets/minio-targets.yml (`minio:9000` on the local
-  # compose network, or the address reachable from Server C).
-  - job_name: minio
-    metrics_path: /minio/v2/metrics/cluster
-    file_sd_configs:
-      - files: ["/etc/prometheus/targets/minio-targets.yml"]
 
   # Prometheus scraping itself (useful to confirm the stack is alive).
   - job_name: prometheus

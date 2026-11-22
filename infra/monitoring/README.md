@@ -1,14 +1,16 @@
 # Observabilidad · Server C (Prometheus + Grafana)
 
-Stack de monitoreo de la API de inferencia y de su almacén de artefactos.
-Prometheus recolecta las métricas que la API expone en `/metrics` y las que
-MinIO expone en `/minio/v2/metrics/cluster`; Grafana las visualiza en el
-dashboard **Real Estate · Inference API**.
+Stack de monitoreo de la API de inferencia. Prometheus recolecta las métricas
+que la API expone en `/metrics`; Grafana las visualiza en el dashboard
+**Real Estate · Inference API**.
 
 ```
-api-inference:8000/metrics                ──scrape──▶  S8 Prometheus  ──query──▶  S9 Grafana
-minio:9000/minio/v2/metrics/cluster       ──scrape──▶       ┘
+api-inference:8000/metrics  ──scrape──▶  S8 Prometheus  ──query──▶  S9 Grafana
 ```
+
+> El almacén de artefactos de este proyecto es **RustFS**, que no expone un
+> endpoint de métricas Prometheus, por lo que no se monitorea. El enunciado
+> (RF10) solo exige observabilidad de la **API de inferencia**.
 
 ## Qué se mide
 
@@ -44,29 +46,9 @@ carpeta). El dashboard usa exactamente estas series:
 
 Los errores se cuentan como `status=~"4..\|5.."`.
 
-**MinIO (job `minio`, métricas nativas v2 del servidor)** — MinIO las publica
-en su puerto S3 bajo `/minio/v2/metrics/cluster`; el servidor corre con
-`MINIO_PROMETHEUS_AUTH_TYPE=public` (compose y k8s) para que Prometheus no
-necesite un bearer token. Solo expone contadores de uso y tráfico, nunca
-objetos ni credenciales:
-
-| Métrica | Tipo | Etiquetas | Uso en el dashboard |
-|---------|------|-----------|---------------------|
-| `minio_cluster_health_status` | Gauge | `server` | estado (1 = OK) |
-| `minio_cluster_bucket_total` | Gauge | `server` | nº de buckets |
-| `minio_cluster_usage_object_total` | Gauge | `server` | objetos almacenados |
-| `minio_cluster_usage_total_bytes` | Gauge | `server` | bytes almacenados |
-| `minio_cluster_capacity_usable_{free,total}_bytes` | Gauge | `server` | % de capacidad usada |
-| `minio_s3_requests_total` | Counter | `api`, `server` | solicitudes S3 por operación |
-| `minio_s3_requests_errors_total` | Counter | `api`, `server` | errores S3 (total y por operación) |
-| `minio_s3_traffic_{received,sent}_bytes` | Counter | `server` | tráfico S3 |
-| `minio_s3_requests_ttfb_seconds_distribution` | Histogram | `api`, `le`, `server` | latencia TTFB p50/p95/p99 |
-| `minio_node_process_cpu_total_seconds` | Counter | `server` | CPU de MinIO |
-| `minio_node_process_resident_memory_bytes` | Gauge | `server` | memoria de MinIO |
-
-Las series de buckets/objetos/bytes las calcula el scanner de MinIO, así que
-aparecen unos minutos después del arranque; las de solicitudes aparecen con la
-primera operación S3 (por ejemplo, al registrar un modelo en MLflow).
+> El almacén de artefactos (RustFS) no expone métricas Prometheus, así que el
+> dashboard no incluye paneles de almacenamiento. Si en el futuro se adopta un
+> store con endpoint de métricas, se añade aquí su job de scrape y su sección.
 
 ## Paneles del dashboard
 
@@ -78,10 +60,6 @@ y tasa de error (KPI y en el tiempo).
 **Recursos del pod** — CPU y memoria de la API.
 **MLOps** — predicciones por resultado; latencia de predicción p50/p95/p99;
 recargas de modelo; solicitudes en curso; fallos de log.
-**MinIO · almacén de artefactos (S3)** — estado · buckets · objetos · datos
-almacenados · capacidad usada · errores S3 (KPIs); solicitudes y errores S3 por
-operación; tráfico recibido/enviado; latencia TTFB p50/p95/p99; CPU y memoria
-de MinIO.
 
 ## Uso local
 
@@ -111,18 +89,13 @@ docker compose --env-file ../../.env -f docker-compose.yml --profile monitoring 
 Grafana abre directamente en el dashboard **Real Estate · Inference API** (datasource
 y dashboard se aprovisionan solos desde `grafana/provisioning`).
 
-Prometheus hace scrape de los targets definidos en
+Prometheus hace scrape del target definido en
 [`prometheus/targets/api-targets.yml`](prometheus/targets/api-targets.yml)
-(`api-inference.real-estate.svc.cluster.local:8000`) y
-[`prometheus/targets/minio-targets.yml`](prometheus/targets/minio-targets.yml)
-(`minio.real-estate.svc.cluster.local:9000`). Por defecto apuntan a la API y al
-MinIO del clúster Kubernetes: OrbStack resuelve los Services del clúster desde
-los contenedores. Con el stack de compose usar `api-inference:8000` y
-`minio:9000`. Si la API o MinIO no son alcanzables, el target
-aparece como **DOWN** (Status → Targets) y sus paneles muestran "No data".
-Si MinIO responde `403`, al pod le falta `MINIO_PROMETHEUS_AUTH_TYPE=public`
-(`kubectl apply -k infra/k8s` o `kubectl -n real-estate set env deployment/minio
-MINIO_PROMETHEUS_AUTH_TYPE=public`).
+(`api-inference.real-estate.svc.cluster.local:8000`). Por defecto apunta a la
+API del clúster Kubernetes: OrbStack resuelve los Services del clúster desde los
+contenedores. Con el stack de compose usar `api-inference:8000`. Si la API no es
+alcanzable, el target aparece como **DOWN** (Status → Targets) y sus paneles
+muestran "No data".
 
 ### Conectar a la API (misma máquina)
 
@@ -142,19 +115,16 @@ cd infra/monitoring
 docker compose --env-file ../../.env -f docker-compose.yml -f docker-compose.integration.yml --profile monitoring up -d
 ```
 
-Ahora los targets `real-estate-api` y `minio` pasan a **UP** y los paneles se
-llenan. `file_sd` recarga los targets sin reiniciar, así que para apuntar a otra
-dirección basta editar `prometheus/targets/api-targets.yml` o
-`prometheus/targets/minio-targets.yml`.
+Ahora el target `real-estate-api` pasa a **UP** y los paneles se llenan.
+`file_sd` recarga el target sin reiniciar, así que para apuntar a otra dirección
+basta editar `prometheus/targets/api-targets.yml`.
 
 ## Despliegue en un Server C dedicado
 
 Cuando el monitoreo corre en una máquina aparte del clúster, apunta el scrape a
-la dirección de la API en `prometheus/targets/api-targets.yml` y a la del puerto
-S3 de MinIO en `prometheus/targets/minio-targets.yml` (host:puerto alcanzables
-desde Server C) y levanta el stack con `docker-compose.yml`. Prometheus recarga
-los targets sin reiniciar (`file_sd`). Con la API en Kubernetes (OrbStack), el
-host resuelve los Services del clúster: `minio.real-estate.svc.cluster.local:9000`.
+la dirección de la API en `prometheus/targets/api-targets.yml` (host:puerto
+alcanzable desde Server C) y levanta el stack con `docker-compose.yml`.
+Prometheus recarga el target sin reiniciar (`file_sd`).
 
 ### Conectar Server C a la red Tailscale (opcional, instalado en el host)
 
@@ -212,8 +182,7 @@ infra/monitoring/
 ├── prometheus/
 │   ├── prometheus.yml                    configuración de scrape (file_sd)
 │   └── targets/
-│       ├── api-targets.yml               target de la API (editable por entorno)
-│       └── minio-targets.yml             target de MinIO (k8s por defecto; editable por entorno)
+│       └── api-targets.yml               target de la API (editable por entorno)
 └── grafana/
     ├── provisioning/
     │   ├── datasources/datasource.yml    Prometheus (uid: prometheus, URL por env)

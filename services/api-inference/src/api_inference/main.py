@@ -17,7 +17,14 @@ from api_inference.metrics import METRICS_PATH, MetricsMiddleware, metrics_respo
 from api_inference.model import ModelLoadError, ModelService
 from api_inference.predict import build_router, build_validation_handler
 from api_inference.repository import InferenceLogRepository, PostgresInferenceLogRepository
-from api_inference.schemas import ErrorDetail, HealthResponse, ModelInfoResponse, ReloadResponse
+from api_inference.schemas import (
+    BatchHistoryEntry,
+    ErrorDetail,
+    HealthResponse,
+    HistoryResponse,
+    ModelInfoResponse,
+    ReloadResponse,
+)
 from api_inference.settings import Settings, get_settings
 from api_inference.spool import DurableInferenceLog, InferenceLogSpool
 
@@ -166,7 +173,6 @@ def create_app(
     @app.get("/model-info", response_model=ModelInfoResponse, tags=["model"])
     async def model_info() -> ModelInfoResponse:
         info = asdict(service.info())
-        info["classes"] = list(info["classes"]) if info["classes"] else None
         return ModelInfoResponse(**info, tracking_uri=settings.mlflow_tracking_uri)
 
     @app.post("/model/reload", response_model=ReloadResponse, tags=["model"])
@@ -185,6 +191,28 @@ def create_app(
             current_version=loaded.version,
             changed=previous != loaded.version,
         )
+
+    @app.get("/history", response_model=HistoryResponse, tags=["history"])
+    async def history(limit: int = 100) -> HistoryResponse:
+        """Training/promotion log per batch (RF9), read from the audit schema.
+
+        Streamlit consumes this instead of querying the database directly, so
+        the UI needs no database credentials. A database outage returns 503;
+        the model keeps serving predictions regardless.
+        """
+        bounded = max(1, min(limit, 500))
+        try:
+            rows = await repo.list_history(bounded)
+        except Exception as exc:
+            logger.warning("history: query failed: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=ErrorDetail(
+                    error_code="database_unavailable",
+                    message="the training history could not be read; retry later",
+                ).model_dump(),
+            ) from exc
+        return HistoryResponse(entries=[BatchHistoryEntry(**row) for row in rows])
 
     @app.get(METRICS_PATH, include_in_schema=False)
     async def metrics() -> Response:

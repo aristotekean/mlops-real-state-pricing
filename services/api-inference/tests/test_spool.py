@@ -18,10 +18,9 @@ from test_metrics import sample_value, scrape
 def _record(**overrides) -> InferenceLogRecord:
     base = dict(
         request_id=uuid.uuid4(),
-        input_data={"race": "Caucasian", "time_in_hospital": 6},
+        input_data={"status": "for_sale", "bed": 3, "house_size": 1800.0},
         status="succeeded",
-        prediction="NO",
-        probabilities={"NO": 0.8, ">30": 0.15, "<30": 0.05},
+        prediction=350_000.0,
         model_name="real_estate",
         model_version="3",
         model_alias="production",
@@ -264,7 +263,7 @@ async def test_predict_spools_row_when_database_is_down_and_replays_later(
     assert str(row.request_id) == request_id
     assert row.status == "succeeded"
     assert row.input_data == features
-    assert row.prediction == "NO"
+    assert row.prediction == 350_000.0
     assert (row.model_name, row.model_version) == ("real_estate", "3")
     assert row.requested_at is not None and row.requested_at.tzinfo is not None
     final = await scrape(client)

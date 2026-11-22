@@ -61,7 +61,7 @@ async def test_metrics_track_prediction_outcomes(running_client):
     invalid_before = sample_value(before, "predictions_total", {"status": "validation_error"}) or 0
 
     await client.post("/predict", json={"features": valid_features()})
-    await client.post("/predict", json={"features": {"encounter_id": 1}})
+    await client.post("/predict", json={"features": {"unknown_key": 1}})
     after = await scrape(client)
 
     assert sample_value(after, "predictions_total", {"status": "succeeded"}) == ok_before + 1

@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from real_estate_model.contract import TARGET_CLASSES, input_frame
+from real_estate_model.contract import input_frame
 
 from api_inference.metrics import MODEL_RELOADS, set_model_info
 
@@ -48,7 +49,6 @@ class LoadedModel:
     alias: str
     run_id: str | None
     loaded_at: datetime
-    classes: tuple[str, ...]
 
     @property
     def uri(self) -> str:
@@ -57,8 +57,9 @@ class LoadedModel:
 
 @dataclass(frozen=True)
 class PredictionResult:
-    prediction: str
-    probabilities: dict[str, float] | None
+    # The estimated price (the regression target). A plain float so the API
+    # returns a JSON number and ``inference.logs.prediction`` stores it as one.
+    prediction: float
     model: LoadedModel
 
 
@@ -73,7 +74,6 @@ class ModelInfo:
     last_check_at: datetime | None
     last_error: str | None
     refresh_seconds: float
-    classes: tuple[str, ...] | None
 
 
 ResolveVersion = Callable[[str, str], RegisteredVersion]
@@ -94,20 +94,13 @@ def mlflow_resolve_version(name: str, alias: str) -> RegisteredVersion:
 
 
 def mlflow_load_model(model_uri: str) -> Any:
-    """Blocking: download and deserialise the sklearn flavor (skops format)."""
+    """Blocking: download and deserialise the sklearn flavor."""
     import mlflow.sklearn
 
     try:
         return mlflow.sklearn.load_model(model_uri)
     except Exception as exc:
         raise ModelLoadError(f"cannot load {model_uri}: {exc}") from exc
-
-
-def _classes_of(model: Any) -> tuple[str, ...]:
-    classes = getattr(model, "classes_", None)
-    if classes is None:
-        return TARGET_CLASSES
-    return tuple(str(label) for label in classes)
 
 
 class ModelService:
@@ -206,7 +199,6 @@ class ModelService:
             alias=target.alias,
             run_id=target.run_id,
             loaded_at=datetime.now(UTC),
-            classes=_classes_of(model),
         )
         previous = self.loaded
         self.loaded = loaded  # atomic reference swap
@@ -230,15 +222,10 @@ class ModelService:
     @staticmethod
     def _predict_sync(loaded: LoadedModel, features: Mapping[str, Any]) -> PredictionResult:
         frame = input_frame([features])
-        prediction = str(loaded.model.predict(frame)[0])
-        probabilities: dict[str, float] | None = None
-        predict_proba = getattr(loaded.model, "predict_proba", None)
-        if predict_proba is not None:
-            row = predict_proba(frame)[0]
-            probabilities = {
-                label: float(score) for label, score in zip(loaded.classes, row, strict=True)
-            }
-        return PredictionResult(prediction=prediction, probabilities=probabilities, model=loaded)
+        prediction = float(loaded.model.predict(frame)[0])
+        if not math.isfinite(prediction):
+            raise ValueError(f"model returned a non-finite price: {prediction!r}")
+        return PredictionResult(prediction=prediction, model=loaded)
 
     # --------------------------------------------------------------- reporting
     def info(self) -> ModelInfo:
@@ -253,5 +240,4 @@ class ModelService:
             last_check_at=self.last_check_at,
             last_error=self.last_error,
             refresh_seconds=self.refresh_seconds,
-            classes=loaded.classes if loaded else None,
         )
