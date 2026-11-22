@@ -1,0 +1,92 @@
+# Host-based routing to the four HTTP services of Server A: one HTTPRoute per
+# backend, all attached to the `real-estate` Gateway (gateway.yaml).
+# `kubectl -n real-estate get httproute` shows the whole routing table.
+#
+# Hosts use OrbStack's wildcard domain: every `*.k8s.orb.local` name resolves
+# on the Mac to the cluster's LoadBalancer, so no /etc/hosts entries are
+# needed. On a Linux server replace them with the Tailscale name (or IP) of
+# the node, e.g. `mlflow.<node>.<tailnet>.ts.net`, and extend the MLflow
+# allow-lists through MLFLOW_ALLOWED_HOSTS and MLFLOW_CORS_ALLOWED_ORIGINS in
+# base/mlflow/deployment.yaml; `--allowed-hosts` and `--cors-allowed-origins`
+# already cover `*.orb.local`, nothing else.
+#
+# A rule without `matches` matches every path (PathPrefix `/`). backendRefs
+# take the Service port number: Gateway API does not resolve port names.
+#
+# Nothing here sets timeouts or body limits. Traefik does not cap the request
+# body and does not cut idle upstreams or websockets (Streamlit keeps one open
+# for the whole session); the only limit that matters, the time allowed to
+# read a request, is raised on the entryPoint in infra/k8s/traefik.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: frontend
+  labels:
+    app.kubernetes.io/name: gateway
+spec:
+  parentRefs:
+    - name: real-estate
+  hostnames:
+    - frontend.k8s.orb.local
+  rules:
+    - backendRefs:
+        - name: frontend
+          port: 8501
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: api-inference
+  labels:
+    app.kubernetes.io/name: gateway
+spec:
+  parentRefs:
+    - name: real-estate
+  hostnames:
+    - api.k8s.orb.local
+    # Same API under the Mac's Tailscale MagicDNS name, for load tests run
+    # from another machine of the tailnet (infra/load-testing). OrbStack
+    # publishes the Traefik LoadBalancer on the Mac's localhost:80 only with
+    # `orb config set k8s.expose_services true` (a Kubernetes reset turns it
+    # off; `orb stop` + `orb start` applies it), and the Mac then forwards
+    # that port to the tailnet as raw TCP, so the Host header reaches Traefik:
+    # `tailscale serve --bg --tcp=80 tcp://127.0.0.1:80`. Targeting the
+    # LoadBalancer IP (192.168.139.x) from tailscale serve does not work:
+    # tailscaled has no route into OrbStack's virtual network.
+    - kevins-macbook-pro.tail6eea58.ts.net
+  rules:
+    - backendRefs:
+        - name: api-inference
+          port: 8000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: mlflow
+  labels:
+    app.kubernetes.io/name: gateway
+spec:
+  parentRefs:
+    - name: real-estate
+  hostnames:
+    - mlflow.k8s.orb.local
+  rules:
+    - backendRefs:
+        - name: mlflow
+          port: 5000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: airflow
+  labels:
+    app.kubernetes.io/name: gateway
+spec:
+  parentRefs:
+    - name: real-estate
+  hostnames:
+    - airflow.k8s.orb.local
+  rules:
+    - backendRefs:
+        - name: airflow-apiserver
+          port: 8080

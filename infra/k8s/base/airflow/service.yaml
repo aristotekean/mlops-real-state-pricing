@@ -1,4 +1,4 @@
-# Web UI and REST API of the api-server container, reached by the Ingress. The
+# Web UI and REST API of the api-server container, reached by its HTTPRoute. The
 # name matches the compose hostname `airflow-apiserver:8080`; inside the pod the
 # task runners use localhost instead (AIRFLOW__CORE__EXECUTION_API_SERVER_URL
 # in base/airflow/kustomization.yaml).

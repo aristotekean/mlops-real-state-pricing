@@ -1,0 +1,22 @@
+# Traefik as the Gateway API controller of the cluster. Cluster-level and
+# installed once, so it is NOT part of the root kustomization (infra/k8s) that
+# Argo CD syncs: it lives in its own `traefik` namespace and owns the
+# cluster-scoped GatewayClass and RBAC.
+#
+#   kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.3/standard-install.yaml
+#   kubectl apply -k infra/k8s/traefik
+#
+# The CRDs come first: the GatewayClass below is one of them. v1.6.3 is the
+# Gateway API version the pinned Traefik release supports; bump both together.
+#
+# Namespaces are written in each manifest instead of using the kustomize
+# `namespace:` transformer, so the ClusterRoleBinding subject stays explicit.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - rbac.yaml
+  - deployment.yaml
+  - service.yaml
+  - gatewayclass.yaml

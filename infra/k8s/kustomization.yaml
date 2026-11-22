@@ -41,7 +41,7 @@ resources:
   - base/frontend
   - base/postgres-airflow
   - base/airflow
-  - base/ingress
+  - base/gateway
 
 # Non-secret ConfigMaps rendered from .env by scripts/render-env.sh and
 # committed, so a configuration change reaches the cluster through git.
