@@ -1,8 +1,13 @@
 # Data API of the course (external source, NOT developed by the team): serves
 # the real estate listings of each group in batches, one batch per GET /data.
 #
-# The image is the one published by the instructor, pinned by tag, and only
-# exists for linux/amd64 (it runs under emulation on Apple Silicon nodes).
+# The image is the one published by the instructor (tag data-api-pf-v2) and
+# only exists for linux/amd64. It is pinned by the digest of that amd64
+# manifest instead of by tag: an arm64 node (Apple Silicon) resolving the tag
+# fails with "no matching manifest for linux/arm64", while the digest skips
+# platform selection and the container runs under emulation. If the instructor
+# republishes the tag, refresh the digest with
+# `docker buildx imagetools inspect cristiandiaz13/mlops-puj:data-api-pf-v2`.
 #
 # The batch counter lives in the process memory, so the API must not be
 # scaled or restarted casually: one replica, Recreate strategy, and a liveness
@@ -29,7 +34,7 @@ spec:
     spec:
       containers:
         - name: data-api
-          image: cristiandiaz13/mlops-puj:data-api-pf-v2
+          image: cristiandiaz13/mlops-puj@sha256:b7174af936651045bf14925577d438048b1bcf45d69d9e0a6224b03c38613e60
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
