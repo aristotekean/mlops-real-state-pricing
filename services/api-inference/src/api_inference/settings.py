@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     # spool still fills, ``replay`` is then only called explicitly).
     inference_log_replay_seconds: float = Field(default=15, ge=0)
 
+    otel_exporter_otlp_endpoint: str | None = None
+    otel_traces_sample_ratio: float = Field(default=1.0, ge=0, le=1)
+
     log_level: str = "INFO"
 
     @property

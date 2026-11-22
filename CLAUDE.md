@@ -67,6 +67,8 @@ kubectl apply -k infra/k8s/generated && kubectl apply -k infra/k8s
 
 `create_app` in `main.py` takes its dependencies (model registry functions, inference-log repository) as arguments; tests inject the in-memory fakes from `tests/conftest.py`. `ModelService` polls the registry alias every `MODEL_REFRESH_SECONDS` and swaps the model without a restart; with no `production` model, `/predict` returns 503 and `/health` returns 200 with `model_loaded=false`. Every request is written to `inference.logs` on `postgres-train` through `DurableInferenceLog`, which spools rows to a JSONL file while the database is down and replays them later. `/history` exposes `audit.batch_history` to the frontend, which talks only to this API.
 
+Tracing is OpenTelemetry exported over OTLP/HTTP to Jaeger (`jaeger` service in `infra/monitoring`), enabled only when `OTEL_EXPORTER_OTLP_ENDPOINT` is non-empty. The trace starts in the frontend (`requests` instrumentation, `frontend/tracing.py`) and the API continues it (`api_inference/tracing.py`). The provider is passed explicitly to `create_app(tracer_provider=...)` and never registered globally, so tests assert on an in-memory exporter. The `opentelemetry-*` pins in both services move together and must stay compatible with the `opentelemetry-sdk` that `mlflow` resolves.
+
 ### Database
 
 `infra/database/migrations` creates the `raw`, `clean`, `audit` and `inference` schemas on `postgres-train`, a different instance from the MLflow and Airflow metadata databases. `migrate.sh` applies files in name order and records them in `public.schema_migrations`. After editing a migration, re-run `render-migrations.sh` and commit the generated ConfigMap.

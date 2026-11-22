@@ -1,11 +1,13 @@
-# Observabilidad · Server C (Prometheus + Grafana)
+# Observabilidad · Server C (Prometheus + Grafana + Jaeger)
 
 Stack de monitoreo de la API de inferencia. Prometheus recolecta las métricas
 que la API expone en `/metrics`; Grafana las visualiza en el dashboard
-**Real Estate · Inference API**.
+**Real Estate · Inference API**. Jaeger recibe las trazas de cada solicitud de
+inferencia, desde el frontend hasta la escritura del log.
 
 ```
 api-inference:8000/metrics  ──scrape──▶  S8 Prometheus  ──query──▶  S9 Grafana
+frontend ──traceparent──▶ api-inference ──OTLP/HTTP──▶  S10 Jaeger
 ```
 
 > El almacén de artefactos de este proyecto es **RustFS**, que no expone un
@@ -67,7 +69,7 @@ El compose raíz incluye este stack bajo el perfil `monitoring`, así que un
 `docker compose up` normal no lo arranca. Desde la raíz del repo:
 
 ```bash
-docker compose up -d prometheus grafana        # solo monitoreo (nombrar el servicio activa su perfil)
+docker compose up -d prometheus grafana jaeger # solo monitoreo (nombrar el servicio activa su perfil)
 docker compose --profile monitoring up -d      # stack completo + monitoreo
 ```
 
@@ -85,6 +87,7 @@ docker compose --env-file ../../.env -f docker-compose.yml --profile monitoring 
 |----------|-----|--------------|
 | Prometheus | <http://localhost:9090> | — |
 | Grafana | <http://localhost:3000> | `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` del `.env` (`admin` / `admin` en `.env.example`) |
+| Jaeger | <http://localhost:16686> | — |
 
 Grafana abre directamente en el dashboard **Real Estate · Inference API** (datasource
 y dashboard se aprovisionan solos desde `grafana/provisioning`).
@@ -118,6 +121,64 @@ docker compose --env-file ../../.env -f docker-compose.yml -f docker-compose.int
 Ahora el target `real-estate-api` pasa a **UP** y los paneles se llenan.
 `file_sd` recarga el target sin reiniciar, así que para apuntar a otra dirección
 basta editar `prometheus/targets/api-targets.yml`.
+
+## Trazas (Jaeger)
+
+La API y el frontend se instrumentan con OpenTelemetry y exportan por OTLP/HTTP
+a Jaeger v2 (`jaegertracing/jaeger`, modo all-in-one). Cada inferencia hecha
+desde la interfaz produce **una traza con dos servicios**:
+
+```
+frontend       POST                    llamada HTTP de Streamlit a la API
+api-inference  └─ POST /predict        solicitud completa (validación incluida)
+api-inference     ├─ model.predict     normalización + inferencia del modelo
+api-inference     └─ inference_log.write   fila en inference.logs (o spool)
+```
+
+| Span | Atributos propios |
+|------|-------------------|
+| `POST /predict` | `inference.request_id`, `inference.outcome` (`succeeded`, `validation_error`, `model_unavailable`, `inference_error`) |
+| `model.predict` | `model.name`, `model.version`, `model.alias`; queda en error si el modelo falla o no está cargado |
+| `inference_log.write` | `inference_log.stored`: `false` si la fila fue al spool o se perdió |
+
+Los dos sentidos del cruce entre el log y las trazas:
+
+- **De una fila a su traza.** `inference.logs.trace_id` guarda el id de la
+  traza; se abre en `http://localhost:16686/trace/<trace_id>`. Solo se guarda
+  si la traza fue muestreada, así que un valor no nulo siempre apunta a una
+  traza exportada.
+- **De una traza a su fila.** En Jaeger, servicio `api-inference` y tag
+  `inference.request_id=<uuid>`, que es la clave primaria de `inference.logs`.
+
+Las trazas **no** se guardan en ninguna de las bases de datos del proyecto:
+PostgreSQL solo conserva ese `trace_id`. Los spans viven en Jaeger.
+
+**Activación.** El tracing se enciende con `OTEL_EXPORTER_OTLP_ENDPOINT`, la URL
+base del receptor OTLP/HTTP (sin `/v1/traces`). Vacía, la API y el frontend no
+crean spans ni abren conexiones. La dirección depende de dónde corren:
+
+| Dónde corren la API y el frontend | Valor |
+|-----------------------------------|-------|
+| compose raíz, junto a Jaeger | `http://jaeger:4318` |
+| Kubernetes u otra máquina | `http://<host de Server C>:<JAEGER_OTLP_PORT>`, una dirección alcanzable desde los pods |
+
+En Kubernetes el valor llega por los ConfigMaps `api-inference-env` y
+`frontend-env`: se cambia en `.env`, se vuelve a ejecutar
+`infra/k8s/scripts/render-env.sh` y se hace commit de `infra/k8s/settings`. El
+valor versionado está vacío, es decir, tracing apagado en el clúster.
+
+**Muestreo.** Quien inicia la traza decide si se guarda. El frontend guarda
+todas las suyas y la API respeta esa decisión. `OTEL_TRACES_SAMPLE_RATIO`
+(de `0` a `1`) solo aplica a las solicitudes que llegan a la API sin traza
+propia, como las de Locust o `curl`; conviene bajarlo durante las pruebas de
+carga para que el tracing no altere la latencia que se mide.
+
+**Qué no se traza.** `/health` y `/metrics` (sondas y scrape), el refresco
+periódico del modelo y el reintento del spool.
+
+**Límites.** Las trazas viven en la memoria del contenedor y se pierden al
+reiniciarlo. Si Jaeger no está arriba, la exportación falla en segundo plano
+(queda un error en el log) y las solicitudes se atienden igual.
 
 ## Despliegue en un Server C dedicado
 
@@ -163,7 +224,7 @@ abrir puertos públicos y sin cambiar el stack de monitoreo.
 Se definen en el `.env` de la raíz del repositorio (plantilla en
 [`.env.example`](../../.env.example)); compose no trae valores por defecto y se
 detiene si falta alguna. En un Server C dedicado basta copiar ese `.env` con
-estas cinco variables.
+estas siete variables.
 
 | Variable | Valor en `.env.example` | Descripción |
 |----------|---------|-------------|
@@ -172,12 +233,21 @@ estas cinco variables.
 | `GRAFANA_PORT` | `3000` | puerto publicado de Grafana |
 | `GRAFANA_ADMIN_USER` | `admin` | usuario admin de Grafana |
 | `GRAFANA_ADMIN_PASSWORD` | `admin` | contraseña admin de Grafana |
+| `JAEGER_UI_PORT` | `16686` | puerto publicado de la UI de Jaeger |
+| `JAEGER_OTLP_PORT` | `4318` | puerto publicado del receptor OTLP/HTTP |
+
+La API y el frontend (Server A) leen además estas dos:
+
+| Variable | Valor sugerido | Descripción |
+|----------|---------|-------------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4318` | receptor OTLP/HTTP; debe existir, vacía apaga el tracing |
+| `OTEL_TRACES_SAMPLE_RATIO` | `1.0` | fracción de solicitudes sin traza propia que la API guarda |
 
 ## Estructura
 
 ```
 infra/monitoring/
-├── docker-compose.yml                    S8 Prometheus + S9 Grafana (independiente)
+├── docker-compose.yml                    S8 Prometheus + S9 Grafana + S10 Jaeger (independiente)
 ├── docker-compose.integration.yml        overlay: conecta Prometheus a la red de la API
 ├── prometheus/
 │   ├── prometheus.yml                    configuración de scrape (file_sd)

@@ -208,7 +208,7 @@ Además se exportan los colectores por defecto (`process_*` en Linux,
 
 La API lee su configuración del entorno. En compose y en Kubernetes los valores
 salen del `.env` de la raíz del repositorio (`MLFLOW_*`, `MODEL_*`,
-`TRAIN_DB_*`; ver [`.env.example`](../../.env.example)); las demás variables de
+`TRAIN_DB_*`, `OTEL_*`; ver [`.env.example`](../../.env.example)); las demás variables de
 la tabla toman su valor por defecto.
 
 | Variable | Por defecto | Descripción |
@@ -222,6 +222,8 @@ la tabla toman su valor por defecto.
 | `DB_POOL_MIN` / `DB_POOL_MAX` | `1` / `4` | Tamaño del pool async de psycopg. |
 | `INFERENCE_LOG_SPOOL_PATH` | `spool/inference-logs.jsonl` | Spool en disco para filas de `inference.logs` que la base de datos no aceptó (relativo al directorio de trabajo, `/app` en la imagen). Vacío lo desactiva. |
 | `INFERENCE_LOG_REPLAY_SECONDS` | `15` | Periodo del reintento en segundo plano del spool; `0` lo desactiva. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | — | URL base del receptor OTLP/HTTP de Jaeger (`http://jaeger:4318`). Vacía o ausente, el tracing queda apagado. Ver [`infra/monitoring`](../../infra/monitoring/README.md#trazas-jaeger). |
+| `OTEL_TRACES_SAMPLE_RATIO` | `1.0` | Fracción (de `0` a `1`) de solicitudes sin traza propia que se guardan; las iniciadas por el frontend siguen su decisión. |
 | `LOG_LEVEL` | `INFO` | Nivel de logging estándar. |
 
 ## Desarrollo local

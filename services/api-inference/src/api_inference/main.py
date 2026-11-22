@@ -12,6 +12,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Response, status
 from fastapi.exceptions import RequestValidationError
+from opentelemetry.sdk.trace import TracerProvider
 
 from api_inference.metrics import METRICS_PATH, MetricsMiddleware, metrics_response
 from api_inference.model import ModelLoadError, ModelService
@@ -27,6 +28,7 @@ from api_inference.schemas import (
 )
 from api_inference.settings import Settings, get_settings
 from api_inference.spool import DurableInferenceLog, InferenceLogSpool
+from api_inference.tracing import build_tracer_provider, get_tracer, instrument_app
 
 logger = logging.getLogger("api_inference")
 
@@ -92,6 +94,7 @@ def create_app(
     settings: Settings | None = None,
     model_service: ModelService | None = None,
     repository: InferenceLogRepository | None = None,
+    tracer_provider: TracerProvider | None = None,
 ) -> FastAPI:
     settings = settings or get_settings()
     _configure_logging(settings.log_level)
@@ -115,6 +118,15 @@ def create_app(
         else None
     )
     inference_log = DurableInferenceLog(repo, spool)
+    owned_provider = (
+        None
+        if tracer_provider is not None
+        else build_tracer_provider(
+            settings.otel_exporter_otlp_endpoint, settings.otel_traces_sample_ratio
+        )
+    )
+    provider = tracer_provider or owned_provider
+    tracer = get_tracer(provider)
 
     async def _cancel(task: asyncio.Task[None] | None) -> None:
         if task is None:
@@ -147,15 +159,21 @@ def create_app(
             await _cancel(refresh_task)
             await _cancel(replay_task)
             await repo.close()
+            if owned_provider is not None:
+                await asyncio.to_thread(owned_provider.shutdown)
 
     app = FastAPI(title="Real Estate Inference API", version=API_VERSION, lifespan=lifespan)
     app.state.settings = settings
     app.state.model_service = service
     app.state.repository = repo
     app.state.inference_log = inference_log
-    app.include_router(build_router(service, repo, inference_log))
-    app.add_exception_handler(RequestValidationError, build_validation_handler(inference_log))
+    app.include_router(build_router(service, repo, inference_log, tracer))
+    app.add_exception_handler(
+        RequestValidationError, build_validation_handler(inference_log, tracer)
+    )
     app.add_middleware(MetricsMiddleware)
+    if provider is not None:
+        instrument_app(app, provider)
 
     @app.get("/health", response_model=HealthResponse, tags=["ops"])
     async def health() -> HealthResponse:

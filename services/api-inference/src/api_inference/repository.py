@@ -35,6 +35,7 @@ class InferenceLogRecord:
     processing_time_ms: float | None = None
     error_code: str | None = None
     error_message: str | None = None
+    trace_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -79,12 +80,12 @@ _INSERT = """
 INSERT INTO inference.logs (
     request_id, requested_at, input_data, prediction,
     model_name, model_version, model_alias, processing_time_ms,
-    status, error_code, error_message
+    status, error_code, error_message, trace_id
 ) VALUES (
     %(request_id)s, COALESCE(%(requested_at)s, CURRENT_TIMESTAMP),
     %(input_data)s, %(prediction)s,
     %(model_name)s, %(model_version)s, %(model_alias)s, %(processing_time_ms)s,
-    %(status)s, %(error_code)s, %(error_message)s
+    %(status)s, %(error_code)s, %(error_message)s, %(trace_id)s
 )
 """
 
@@ -175,6 +176,7 @@ class PostgresInferenceLogRepository:
             "status": record.status,
             "error_code": record.error_code,
             "error_message": record.error_message,
+            "trace_id": record.trace_id,
         }
         async with self._require_pool().connection() as conn:
             await conn.execute(_INSERT, params)

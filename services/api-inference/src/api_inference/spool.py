@@ -56,6 +56,8 @@ def encode_record(record: InferenceLogRecord) -> str:
     payload["request_id"] = str(record.request_id)
     if record.requested_at is not None:
         payload["requested_at"] = record.requested_at.isoformat()
+    if record.trace_id is None:
+        del payload["trace_id"]
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
 

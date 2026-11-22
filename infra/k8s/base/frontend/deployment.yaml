@@ -22,7 +22,8 @@ spec:
         - name: streamlit
           image: aristotekean/real-estate-frontend
           imagePullPolicy: IfNotPresent
-          # API_URL, from .env (infra/k8s/settings).
+          # API_URL and OTEL_EXPORTER_OTLP_ENDPOINT (empty turns tracing off),
+          # from .env (infra/k8s/settings).
           envFrom:
             - configMapRef:
                 name: frontend-env

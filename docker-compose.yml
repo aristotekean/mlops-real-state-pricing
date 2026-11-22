@@ -6,6 +6,7 @@
 #   S5 postgres-train + S6 Airflow     see services/airflow/compose.yml (included below)
 #   S7 Frontend                ---->  S4 Inference API (Streamlit UI)
 #   S8 Prometheus + S9 Grafana         see infra/monitoring/docker-compose.yml (`monitoring` profile)
+#   S10 Jaeger                 <----  S4 + S7 (traces over OTLP; same file and profile)
 #
 # From the repository root:
 #   docker compose up -d --build     # build the project images on this host
@@ -219,6 +220,12 @@ services:
       TRAIN_DB_NAME: ${TRAIN_DB_NAME:?}
       TRAIN_DB_USER: ${TRAIN_DB_USER:?}
       TRAIN_DB_PASSWORD: ${TRAIN_DB_PASSWORD:?}
+      # Traces go to Jaeger over OTLP/HTTP. The endpoint must be defined but
+      # may be empty, which turns tracing off. The ratio samples the requests
+      # that reach the API without a trace of their own (Locust, curl); the
+      # ones started by the frontend are always kept.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT?}
+      OTEL_TRACES_SAMPLE_RATIO: ${OTEL_TRACES_SAMPLE_RATIO:?}
     # On-disk spool for inference.logs rows written while postgres-train is
     # down (default INFERENCE_LOG_SPOOL_PATH=spool/inference-logs.jsonl under
     # /app); a named volume keeps them across container restarts.
@@ -251,6 +258,8 @@ services:
       - "${FRONTEND_PORT:?}:8501"
     environment:
       API_URL: ${API_URL:?}
+      # The trace of an inference request starts in the UI; empty disables it.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT?}
     depends_on:
       - api-inference
     restart: unless-stopped
