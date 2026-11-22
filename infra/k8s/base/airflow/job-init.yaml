@@ -14,9 +14,9 @@
 # mounted and the image already owns /opt/airflow, so it runs as the airflow
 # user (uid 50000, gid 0). Re-running is safe.
 #
-# A Job's pod template is immutable once created, and infra/k8s/generated
-# (rendered from .env) rewrites this image tag and the hashed names of the
-# ConfigMaps and Secrets it uses. Finished Jobs are garbage-collected after
+# A Job's pod template is immutable once created, and every deploy rewrites
+# this image tag (infra/k8s/kustomization.yaml) and the hashed names of the
+# ConfigMaps it uses (infra/k8s/settings). Finished Jobs are garbage-collected after
 # ttlSecondsAfterFinished, so a later `kubectl apply -k infra/k8s` recreates
 # (and re-runs) the Job instead of failing with "field is immutable"; within
 # that window, delete it by hand before applying.
@@ -26,6 +26,13 @@ metadata:
   name: airflow-init
   labels:
     app.kubernetes.io/name: airflow-init
+  annotations:
+    # Argo CD runs this Job as a Sync hook: it is deleted and recreated on
+    # every sync (so the immutable pod template never blocks one) and is not
+    # tracked as live state (so the TTL cleanup below does not show the
+    # application as OutOfSync). `kubectl apply` ignores both annotations.
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
 spec:
   # Bounded on both axes: at most 4 retries of the pod, and the whole Job is
   # killed and marked Failed after 15 minutes regardless of retries. The

@@ -1,4 +1,4 @@
-# Ingress: the only entry point into the `real_estate` namespace from outside the
+# Ingress: the only entry point into the `real-estate` namespace from outside the
 # cluster. It needs an ingress controller with class `nginx`; on OrbStack
 # install ingress-nginx from the upstream manifest first (see README).
 apiVersion: kustomize.config.k8s.io/v1beta1
