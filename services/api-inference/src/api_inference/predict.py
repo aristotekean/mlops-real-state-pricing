@@ -14,7 +14,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from api_inference.metrics import PREDICTION_DURATION, PREDICTIONS
-from api_inference.model import ModelNotLoadedError, ModelService
+from api_inference.model import (
+    InferenceError,
+    InferenceTimeoutError,
+    LoadedModel,
+    ModelBusyError,
+    ModelNotLoadedError,
+    ModelService,
+)
 from api_inference.repository import FeedbackRecord, InferenceLogRecord, InferenceLogRepository
 from api_inference.spool import DurableInferenceLog
 from api_inference.schemas import (
@@ -86,49 +93,75 @@ def build_router(
         submitted = raw_body["features"]
         started = time.perf_counter()
 
+        async def failed(
+            status_code: int,
+            error_code: str,
+            public_message: str,
+            logged_message: str,
+            model: LoadedModel | None,
+            headers: dict[str, str] | None = None,
+        ) -> JSONResponse:
+            """Count, log and answer one failed prediction; ``model`` is the
+            version that handled it, when one did."""
+            PREDICTIONS.labels(status=error_code).inc()
+            await _safe_log(
+                inference_log,
+                InferenceLogRecord(
+                    request_id=request_id,
+                    input_data=submitted,
+                    status="failed",
+                    requested_at=requested_at,
+                    model_name=model.name if model else service.name,
+                    model_version=model.version if model else None,
+                    model_alias=model.alias if model else service.alias,
+                    error_code=error_code,
+                    error_message=logged_message[:_MAX_ERROR_MESSAGE],
+                ),
+            )
+            response = _error_response(status_code, request_id, error_code, public_message)
+            response.headers.update(headers or {})
+            return response
+
         try:
             result = await service.predict(payload.feature_values())
         except ModelNotLoadedError as exc:
-            PREDICTIONS.labels(status="model_unavailable").inc()
-            await _safe_log(
-                inference_log,
-                InferenceLogRecord(
-                    request_id=request_id,
-                    input_data=submitted,
-                    status="failed",
-                    requested_at=requested_at,
-                    model_name=service.name,
-                    model_alias=service.alias,
-                    error_code="model_unavailable",
-                    error_message=str(exc),
-                ),
+            return await failed(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "model_unavailable",
+                str(exc),
+                str(exc),
+                None,
             )
-            return _error_response(
-                status.HTTP_503_SERVICE_UNAVAILABLE, request_id, "model_unavailable", str(exc)
+        except ModelBusyError as exc:
+            return await failed(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "overloaded",
+                "the service is at capacity; retry shortly",
+                str(exc),
+                service.loaded,
+                {"Retry-After": "1"},
+            )
+        except InferenceTimeoutError as exc:
+            logger.warning("inference timed out for request %s: %s", request_id, exc)
+            return await failed(
+                status.HTTP_504_GATEWAY_TIMEOUT,
+                "inference_timeout",
+                "the model took too long to score this observation",
+                str(exc),
+                exc.model,
             )
         except Exception as exc:
-            loaded = service.loaded
-            PREDICTIONS.labels(status="inference_error").inc()
             logger.exception("inference failed for request %s", request_id)
-            await _safe_log(
-                inference_log,
-                InferenceLogRecord(
-                    request_id=request_id,
-                    input_data=submitted,
-                    status="failed",
-                    requested_at=requested_at,
-                    model_name=loaded.name if loaded else service.name,
-                    model_version=loaded.version if loaded else None,
-                    model_alias=loaded.alias if loaded else service.alias,
-                    error_code="inference_error",
-                    error_message=f"{type(exc).__name__}: {exc}"[:_MAX_ERROR_MESSAGE],
-                ),
-            )
-            return _error_response(
+            if isinstance(exc, InferenceError):
+                model, message = exc.model, str(exc)
+            else:
+                model, message = service.loaded, f"{type(exc).__name__}: {exc}"
+            return await failed(
                 status.HTTP_500_INTERNAL_SERVER_ERROR,
-                request_id,
                 "inference_error",
                 "the model failed to score this observation",
+                message,
+                model,
             )
 
         elapsed = time.perf_counter() - started

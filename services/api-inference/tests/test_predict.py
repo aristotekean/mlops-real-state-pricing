@@ -57,7 +57,7 @@ async def test_predict_feeds_normalised_frame_to_model(running_client):
 
     await client.post("/predict", json={"features": features})
 
-    frame = model.frames[0]
+    frame = model.frames[-1]
     assert list(frame.columns) == list(INPUT_COLUMNS)
     assert len(frame) == 1
     assert frame.loc[0, "bed"] == 3.0
@@ -150,19 +150,26 @@ async def test_predict_503_when_model_unavailable_and_logs_failure(running_clien
 
 
 async def test_predict_500_on_inference_error(running_client):
-    class BrokenModel(FakeModel):
-        def predict(self, frame):
-            raise ValueError("boom")
+    class BreaksAfterLoadModel(FakeModel):
+        broken = False
 
-    app, _, repository, _ = make_app(registry=FakeRegistry(model=BrokenModel()))
+        def predict(self, frame):
+            if self.broken:
+                raise ValueError("boom")
+            return super().predict(frame)
+
+    model = BreaksAfterLoadModel()
+    app, _, repository, _ = make_app(registry=FakeRegistry(model=model))
     client = await running_client(app)
+    model.broken = True
 
     response = await client.post("/predict", json={"features": valid_features()})
 
     assert response.status_code == 500
     assert response.json()["detail"]["error_code"] == "inference_error"
     assert repository.rows[0].error_code == "inference_error"
-    assert "boom" in repository.rows[0].error_message
+    assert repository.rows[0].model_version == "3"
+    assert "ValueError: boom" in repository.rows[0].error_message
 
 
 async def test_predict_still_answers_when_log_write_fails(running_client):

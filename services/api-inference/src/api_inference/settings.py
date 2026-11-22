@@ -24,6 +24,34 @@ class Settings(BaseSettings):
     # and starts in ``unavailable`` state (the refresh task keeps retrying).
     model_load_retries: int = Field(default=5, ge=1)
     model_load_backoff_seconds: float = Field(default=2.0, ge=0)
+    model_resolve_timeout_seconds: float = Field(
+        default=15.0, gt=0, description="Limit for one registry alias lookup."
+    )
+    model_load_timeout_seconds: float = Field(
+        default=120.0, gt=0, description="Limit for one artifact download plus smoke prediction."
+    )
+    model_startup_wait_seconds: float = Field(
+        default=5.0,
+        ge=0,
+        description="How long startup waits for the first load before the port "
+        "opens anyway; the load then continues in the background.",
+    )
+    readiness_requires_model: bool = Field(
+        default=False,
+        description="When true, /ready stays 503 until a model is loaded. When "
+        "false, it turns 200 once the startup load attempts finished, so a "
+        "registry with no production model keeps /history and /model-info reachable.",
+    )
+
+    predict_max_workers: int = Field(
+        default=4, ge=1, description="Threads that run model predictions."
+    )
+    predict_max_pending: int = Field(
+        default=64, ge=0, description="Predictions allowed to queue; beyond it /predict is 503."
+    )
+    predict_timeout_seconds: float = Field(
+        default=10.0, gt=0, description="A slower prediction answers 504."
+    )
 
     # Training database (hosts ``inference.logs``). Either a full URL or parts.
     train_database_url: str | None = None
@@ -43,6 +71,21 @@ class Settings(BaseSettings):
     # Period of the background replay of spooled rows; ``0`` disables it (the
     # spool still fills, ``replay`` is then only called explicitly).
     inference_log_replay_seconds: float = Field(default=15, ge=0)
+    inference_log_circuit_seconds: float = Field(
+        default=30.0,
+        ge=0,
+        description="After a failed write, rows go straight to the spool for "
+        "this long (or until a replay drains it); 0 tries the database every time.",
+    )
+    inference_log_spool_max_bytes: int = Field(
+        default=96 * 1024 * 1024,
+        gt=0,
+        description="Rows are dropped past this size. A replay briefly holds two "
+        "copies, so keep it well under half the volume (256Mi emptyDir in Kubernetes).",
+    )
+    health_db_timeout_seconds: float = Field(
+        default=1.0, gt=0, description="Limit for the database ping /health reports."
+    )
 
     log_level: str = "INFO"
 

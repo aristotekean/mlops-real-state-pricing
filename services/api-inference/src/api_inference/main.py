@@ -12,6 +12,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Response, status
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from api_inference.metrics import METRICS_PATH, MetricsMiddleware, metrics_response
 from api_inference.model import ModelLoadError, ModelService
@@ -22,7 +23,9 @@ from api_inference.schemas import (
     ErrorDetail,
     HealthResponse,
     HistoryResponse,
+    LiveResponse,
     ModelInfoResponse,
+    ReadyResponse,
     ReloadResponse,
 )
 from api_inference.settings import Settings, get_settings
@@ -31,6 +34,14 @@ from api_inference.spool import DurableInferenceLog, InferenceLogSpool
 logger = logging.getLogger("api_inference")
 
 API_VERSION = "0.1.0"
+
+MLFLOW_HTTP_DEFAULTS = {
+    "MLFLOW_HTTP_REQUEST_TIMEOUT": "15",
+    "MLFLOW_HTTP_REQUEST_MAX_RETRIES": "2",
+}
+"""Applied only when the variable is unset. MLflow's own defaults (120 s, 7
+retries with backoff) keep a worker thread busy for minutes after the model
+service already gave up on the call."""
 
 
 def _configure_logging(level: str) -> None:
@@ -44,23 +55,45 @@ def _configure_logging(level: str) -> None:
 
 
 async def _initial_load(service: ModelService, settings: Settings) -> None:
-    """Bounded startup retries; on exhaustion the API starts ``unavailable``."""
-    for attempt in range(1, settings.model_load_retries + 1):
-        try:
-            await service.load()
-            return
-        except ModelLoadError as exc:
-            logger.warning(
-                "initial model load attempt %d/%d failed: %s",
-                attempt, settings.model_load_retries, exc,
-            )
-            if attempt < settings.model_load_retries:
-                await asyncio.sleep(settings.model_load_backoff_seconds * attempt)
-    logger.error(
-        "model %s@%s unavailable after %d attempts; serving 503 until the "
-        "background refresh succeeds",
-        settings.model_name, settings.model_alias, settings.model_load_retries,
-    )
+    """Bounded startup retries; on exhaustion the API starts ``unavailable``.
+
+    ``service.startup_settled`` flips when the attempts are over, whatever the
+    outcome: ``/ready`` uses it to keep a pod out of rotation while it is
+    still trying to get its first model.
+    """
+    try:
+        for attempt in range(1, settings.model_load_retries + 1):
+            try:
+                await service.load()
+                return
+            except ModelLoadError as exc:
+                logger.warning(
+                    "initial model load attempt %d/%d failed: %s",
+                    attempt, settings.model_load_retries, exc,
+                )
+                if attempt < settings.model_load_retries:
+                    await asyncio.sleep(settings.model_load_backoff_seconds * attempt)
+        logger.error(
+            "model %s@%s unavailable after %d attempts; serving 503 until the "
+            "background refresh succeeds",
+            settings.model_name, settings.model_alias, settings.model_load_retries,
+        )
+    finally:
+        service.startup_settled = True
+
+
+async def _model_lifecycle(
+    startup: asyncio.Task[None], service: ModelService, settings: Settings
+) -> None:
+    """Alias polling that starts once the ``startup`` load is over. Both run
+    in the background so a slow registry never keeps the server from
+    listening; the lifespan waits on ``startup`` alone, never on this loop."""
+    try:
+        await startup
+    except Exception:
+        logger.exception("initial model load crashed")
+    if settings.model_refresh_seconds > 0:
+        await _refresh_loop(service, settings.model_refresh_seconds)
 
 
 async def _refresh_loop(service: ModelService, interval: float) -> None:
@@ -97,11 +130,18 @@ def create_app(
     _configure_logging(settings.log_level)
     if settings.mlflow_tracking_uri:
         os.environ.setdefault("MLFLOW_TRACKING_URI", settings.mlflow_tracking_uri)
+    for variable, value in MLFLOW_HTTP_DEFAULTS.items():
+        os.environ.setdefault(variable, value)
 
     service = model_service or ModelService(
         name=settings.model_name,
         alias=settings.model_alias,
         refresh_seconds=settings.model_refresh_seconds,
+        resolve_timeout_seconds=settings.model_resolve_timeout_seconds,
+        load_timeout_seconds=settings.model_load_timeout_seconds,
+        predict_max_workers=settings.predict_max_workers,
+        predict_max_pending=settings.predict_max_pending,
+        predict_timeout_seconds=settings.predict_timeout_seconds,
     )
     repo = repository or PostgresInferenceLogRepository(
         lambda: settings.database_url,
@@ -110,11 +150,16 @@ def create_app(
         connect_timeout_seconds=settings.db_connect_timeout_seconds,
     )
     spool = (
-        InferenceLogSpool(Path(settings.inference_log_spool_path))
+        InferenceLogSpool(
+            Path(settings.inference_log_spool_path),
+            max_bytes=settings.inference_log_spool_max_bytes,
+        )
         if settings.inference_log_spool_path
         else None
     )
-    inference_log = DurableInferenceLog(repo, spool)
+    inference_log = DurableInferenceLog(
+        repo, spool, retry_after_seconds=settings.inference_log_circuit_seconds
+    )
 
     async def _cancel(task: asyncio.Task[None] | None) -> None:
         if task is None:
@@ -128,7 +173,8 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await repo.open()
-        refresh_task: asyncio.Task[None] | None = None
+        startup_task: asyncio.Task[None] | None = None
+        model_task: asyncio.Task[None] | None = None
         replay_task: asyncio.Task[None] | None = None
         try:
             if spool is not None and settings.inference_log_replay_seconds > 0:
@@ -136,16 +182,25 @@ def create_app(
                     _replay_loop(inference_log, settings.inference_log_replay_seconds),
                     name="inference-log-replay",
                 )
-            await _initial_load(service, settings)
-            if settings.model_refresh_seconds > 0:
-                refresh_task = asyncio.create_task(
-                    _refresh_loop(service, settings.model_refresh_seconds),
-                    name="model-refresh",
+            startup_task = asyncio.create_task(
+                _initial_load(service, settings), name="model-startup"
+            )
+            model_task = asyncio.create_task(
+                _model_lifecycle(startup_task, service, settings), name="model-lifecycle"
+            )
+            await asyncio.wait({startup_task}, timeout=settings.model_startup_wait_seconds)
+            if not service.startup_settled:
+                logger.warning(
+                    "model not loaded after %g s; accepting connections while "
+                    "the load continues in the background",
+                    settings.model_startup_wait_seconds,
                 )
             yield
         finally:
-            await _cancel(refresh_task)
+            await _cancel(model_task)
+            await _cancel(startup_task)
             await _cancel(replay_task)
+            service.close()
             await repo.close()
 
     app = FastAPI(title="Real Estate Inference API", version=API_VERSION, lifespan=lifespan)
@@ -157,11 +212,42 @@ def create_app(
     app.add_exception_handler(RequestValidationError, build_validation_handler(inference_log))
     app.add_middleware(MetricsMiddleware)
 
+    @app.get("/live", response_model=LiveResponse, tags=["ops"])
+    async def live() -> LiveResponse:
+        """Liveness probe: the process answers. It checks no dependency, so a
+        database or registry outage never gets the container restarted."""
+        return LiveResponse(status="ok")
+
+    @app.get(
+        "/ready",
+        response_model=ReadyResponse,
+        responses={503: {"model": ReadyResponse}},
+        tags=["ops"],
+    )
+    async def ready() -> JSONResponse:
+        """Readiness probe: 503 while the startup load is still running, and
+        afterwards too when ``READINESS_REQUIRES_MODEL`` is set and no model
+        is loaded. The database is not part of it: predictions are served and
+        spooled without it."""
+        model_loaded = service.loaded is not None
+        is_ready = model_loaded or (
+            service.startup_settled and not settings.readiness_requires_model
+        )
+        body = ReadyResponse(
+            status="ready" if is_ready else "not_ready", model_loaded=model_loaded
+        )
+        return JSONResponse(
+            status_code=status.HTTP_200_OK if is_ready else status.HTTP_503_SERVICE_UNAVAILABLE,
+            content=body.model_dump(),
+        )
+
     @app.get("/health", response_model=HealthResponse, tags=["ops"])
     async def health() -> HealthResponse:
-        """Liveness probe: 200 even without a model so the container stays up."""
+        """Human-facing status: always 200, reports the model and a database
+        ping bounded by ``HEALTH_DB_TIMEOUT_SECONDS``. Probes use ``/live``
+        and ``/ready`` instead."""
         try:
-            await repo.ping()
+            await asyncio.wait_for(repo.ping(), settings.health_db_timeout_seconds)
             database = "ok"
         except Exception as exc:
             logger.warning("health: database ping failed: %s", exc)

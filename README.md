@@ -139,7 +139,7 @@ Las bases de datos y RustFS son `StatefulSet` con una réplica: el pod tiene ide
 | `postgres-train` | StatefulSet + Job `train-db-migrate` | `postgres-train-env`, `train-db-migrations` | `postgres-train-credentials` | `data-postgres-train-0` (2Gi) | readiness, liveness (`pg_isready`) | 100m/256Mi → 500m/512Mi |
 | `rustfs` | StatefulSet + Job `rustfs-init` | — | `rustfs-credentials` | `data-rustfs-0` (5Gi) | readiness, liveness (`/health/ready`, `/health/live`) | 100m/256Mi → 500m/1Gi |
 | `mlflow` | Deployment | `mlflow-server-env`, `mlflow-client-env` | `mlflow-db-credentials`, `rustfs-credentials` | sin estado (Postgres + RustFS) | startup, readiness, liveness (`/health`) | 250m/768Mi → 1/2Gi |
-| `api-inference` | Deployment + HPA | `api-inference-env`, `mlflow-client-env` | `postgres-train-credentials`, `rustfs-credentials` | `emptyDir` spool (256Mi) | startup, readiness, liveness (`/health`) | 250m/512Mi → 1/1Gi |
+| `api-inference` | Deployment + HPA | `api-inference-env`, `mlflow-client-env` | `postgres-train-credentials`, `rustfs-credentials` | `emptyDir` spool (256Mi) | startup y liveness (`/live`), readiness (`/ready`) | 250m/512Mi → 1/1Gi |
 | `data-api` | Deployment (imagen del curso, fijada por digest) | — | — | sin estado (el contador de lotes vive en memoria) | startup, readiness, liveness (`/health`) | 250m/768Mi → 1/2Gi |
 | `frontend` | Deployment | `frontend-env` | ninguno (no maneja credenciales) | sin estado | startup, readiness, liveness | 100m/256Mi → 500m/512Mi |
 | `airflow` | Deployment + Job `airflow-init` | `airflow-env`, `pipeline-config`, `mlflow-client-env` | `airflow-secrets`, `airflow-db-credentials`, `airflow-admin-user`, `rustfs-credentials`, `postgres-train-credentials` | `airflow-logs` (2Gi, logs de tareas) | api-server: startup, readiness, liveness; scheduler, dag-processor y triggerer: liveness | api-server 250m/512Mi → 500m/1Gi · scheduler 500m/1.5Gi → 2/4Gi · dag-processor 150m/256Mi → 250m/768Mi · triggerer 100m/256Mi → 250m/768Mi |
@@ -294,7 +294,7 @@ Prometheus en <http://localhost:9090> y Grafana en <http://localhost:3000> (`adm
 
 ## Solución de problemas
 
-- `/predict` responde `503`: todavía no hay un modelo con el alias `production` o MLflow no es alcanzable. Activa el DAG y espera la primera corrida; `curl http://api.k8s.orb.local/model-info` muestra el último error.
+- `/predict` responde `503`: todavía no hay un modelo con el alias `production` o MLflow no es alcanzable (`error_code: model_unavailable`). Activa el DAG y espera la primera corrida; `curl http://api.k8s.orb.local/model-info` muestra el último error. Con `error_code: overloaded` la API está al límite de predicciones simultáneas (`PREDICT_MAX_WORKERS` + `PREDICT_MAX_PENDING`): reintenta tras el `Retry-After` o deja que el HPA añada pods.
 - La API sigue sirviendo una versión vieja tras promover otra: el refresco es cada 60 s; `curl -X POST http://api.k8s.orb.local/model/reload` la fuerza.
 - El HPA muestra `TARGETS <unknown>`: metrics-server no está instalado o aún no reporta (tarda alrededor de un minuto). Pods `Pending` al escalar: el nodo no tiene memoria libre que reservar (OrbStack: Settings → System).
 - El pod corre una imagen distinta a la de Docker Hub: el tag ya existía en la máquina (`imagePullPolicy: IfNotPresent` y OrbStack comparte el almacén con Docker). Publica con un tag nuevo.

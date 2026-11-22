@@ -168,24 +168,32 @@ spec:
             limits:
               cpu: "1"
               memory: 1Gi
-          # /health answers 200 even while the model is unavailable, so these
-          # probes only track the process, not the model state (/model-info
-          # does). Up to 150 s for the model-load retries at boot.
+          # /live checks no dependency: a postgres-train or MLflow outage must
+          # not restart a pod that can still predict and spool its logs. The
+          # port opens after at most MODEL_STARTUP_WAIT_SECONDS (5 s); the
+          # model load continues in the background.
+          #
+          # /ready is 503 while that first load is still running, so a pod
+          # added by the HPA or a rollout takes no traffic before it had its
+          # chance to load the model. Once the attempts are over it answers
+          # 200 even without a model (READINESS_REQUIRES_MODEL=false), which
+          # keeps /history and /model-info reachable on a cluster that has not
+          # trained yet. /health stays as the human-facing status.
           startupProbe:
             httpGet:
-              path: /health
+              path: /live
               port: http
             periodSeconds: 5
             failureThreshold: 30
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: http
             periodSeconds: 10
             timeoutSeconds: 5
           livenessProbe:
             httpGet:
-              path: /health
+              path: /live
               port: http
             periodSeconds: 15
             timeoutSeconds: 5

@@ -126,6 +126,11 @@ def make_service(registry: FakeRegistry, settings: Settings) -> ModelService:
         refresh_seconds=settings.model_refresh_seconds,
         resolve_version=registry.resolve,
         load_model=registry.load,
+        resolve_timeout_seconds=settings.model_resolve_timeout_seconds,
+        load_timeout_seconds=settings.model_load_timeout_seconds,
+        predict_max_workers=settings.predict_max_workers,
+        predict_max_pending=settings.predict_max_pending,
+        predict_timeout_seconds=settings.predict_timeout_seconds,
     )
 
 

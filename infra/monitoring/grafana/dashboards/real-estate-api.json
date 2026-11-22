@@ -40,12 +40,12 @@
       "id": 1,
       "type": "stat",
       "title": "Solicitudes totales",
-      "description": "Solicitudes reales atendidas por la API (excluye los health checks de /health; /metrics tampoco se contabiliza).",
+      "description": "Solicitudes reales atendidas por la API (excluye las sondas /health, /live y /ready; /metrics tampoco se contabiliza).",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum(http_requests_total{path!=\"/health\"}) or vector(0)" }
+          "expr": "sum(http_requests_total{path!~\"/health|/live|/ready\"}) or vector(0)" }
       ],
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto",
         "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
