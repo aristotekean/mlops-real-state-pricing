@@ -48,14 +48,14 @@ def random_listing() -> dict:
     beds = random.choices([0, 1, 2, 3, 4, 5, 6], [3, 8, 20, 32, 22, 10, 5])[0]
     status = random.choices(STATUS_VALUES, STATUS_WEIGHTS)[0]
     # A lot without a house (ready_to_build) has no living area.
-    house_size = 100 if status == "ready_to_build" else max(200, min(10_000, int(random.gauss(1_900, 900))))
+    house_size = None if status == "ready_to_build" else max(200, min(10_000, int(random.gauss(1_900, 900))))
     return {
         "status": status,
         "bed": beds,
         "bath": max(0, min(beds + 1, int(random.gauss(beds, 1)))),
         "house_size": house_size,
         "acre_lot": round(min(50.0, random.expovariate(1 / 0.5)), 2),
-        "city": random.choice([city, None]) if random.random() < 0.05 else city,
+        "city": None if random.random() < 0.025 else city,
         "state": state,
         "zip_code": f"{random.randint(1, 99999):05d}",
         "brokered_by": str(random.randint(1, 1200)),
@@ -77,8 +77,12 @@ class InferenceUser(FastHttpUser):
             if response.status_code != 200:
                 response.failure(f"HTTP {response.status_code}")
                 return
-            body = response.json()
-            if "prediction" not in body or "model" not in body:
+            try:
+                body = response.json()
+            except ValueError:
+                response.failure("response body is not JSON")
+                return
+            if not isinstance(body, dict) or "prediction" not in body or "model" not in body:
                 response.failure("response without prediction/model")
 
     @task(1)
