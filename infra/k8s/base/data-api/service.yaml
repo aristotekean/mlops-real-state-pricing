@@ -1,0 +1,15 @@
+# In-cluster endpoint of the Data API, used by Airflow as http://data-api:80
+# (DATA_API_URL in base/airflow pipeline-config).
+apiVersion: v1
+kind: Service
+metadata:
+  name: data-api
+  labels:
+    app.kubernetes.io/name: data-api
+spec:
+  selector:
+    app.kubernetes.io/name: data-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

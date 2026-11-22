@@ -14,7 +14,7 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: real_estate
+  name: real-estate
   labels:
     app.kubernetes.io/name: ingress
   annotations:

@@ -174,13 +174,39 @@ def validate_source_record(record: Mapping[str, Any]) -> list[str]:
     return errors
 
 
-def exclusion_reason(record: Mapping[str, Any]) -> str | None:
-    """Return why a valid record cannot be used for training, if it cannot.
+# Plausible range of each numeric field FOR TRAINING, as (low, high) with None
+# for an open end. A valid record outside a range stays in RAW and CLEAN but is
+# excluded from training: the extremes of the source (515 M USD, 444 bedrooms,
+# 100,000 acres, 1.5 M sq ft) are data-entry errors that dominate any squared
+# error and make linear models extrapolate wildly. The defaults keep ~99.9% of
+# the group data; the pipeline may override them (TRAINING_BOUNDS_JSON).
+DEFAULT_TRAINING_BOUNDS: dict[str, tuple[float | None, float | None]] = {
+    "price": (10_000.0, 20_000_000.0),
+    "bed": (None, 20.0),
+    "bath": (None, 20.0),
+    "house_size": (100.0, 30_000.0),
+    "acre_lot": (None, 1_000.0),
+}
 
-    No exclusion rule is known for this dataset yet; the hook is kept so the
-    pipeline accounts for excluded records the day one is defined.
+
+def exclusion_reason(
+    record: Mapping[str, Any],
+    bounds: Mapping[str, tuple[float | None, float | None]] | None = None,
+) -> str | None:
+    """Return why a VALID record cannot be used for training, if it cannot.
+
+    Expects a record that already passed ``validate_source_record``. Returns
+    ``out_of_range_<column>`` reasons joined by ``;`` or ``None``.
     """
-    return None
+    reasons = []
+    for column, (low, high) in (DEFAULT_TRAINING_BOUNDS if bounds is None else bounds).items():
+        value = record.get(column)
+        if is_missing(value):
+            continue
+        number = _number(column, value)
+        if (low is not None and number < low) or (high is not None and number > high):
+            reasons.append(f"out_of_range_{column}")
+    return ";".join(reasons) or None
 
 
 def record_key(record: Mapping[str, Any]) -> str:

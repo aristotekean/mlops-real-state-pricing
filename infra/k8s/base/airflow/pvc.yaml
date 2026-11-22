@@ -1,16 +1,18 @@
-# Replaces the ../../data/RealEstate bind mount of services/airflow/compose.yml: the
-# training DAG downloads RealEstate.csv (about 20 MB) into this volume on its
-# first run and re-reads it afterwards, so it must survive pod restarts.
+# Task logs of every DAG run. The scheduler's task subprocesses (LocalExecutor)
+# write them and the api-server serves them, so both containers of the pod
+# mount this volume. On a PVC they survive pod restarts and rollouts, which
+# keeps the execution history auditable (an emptyDir lost them).
 #
-# No storageClassName: the cluster default is used (OrbStack: `local-path`,
-# bound when the first pod is scheduled).
+# ReadWriteOnce is enough: one Airflow pod (Recreate strategy). Airflow does
+# not prune logs; 2Gi holds thousands of runs of this DAG.
+# No storageClassName: the cluster default is used (OrbStack: local-path).
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: airflow-dataset
+  name: airflow-logs
 spec:
   accessModes:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 1Gi
+      storage: 2Gi

@@ -5,16 +5,16 @@
 #   bash infra/k8s/scripts/render-env.sh  # .env -> generated/ (after every change)
 #   kubectl apply -k infra/k8s            # deploy / update everything
 #   kubectl kustomize infra/k8s           # render the manifests only
-#   kubectl -n real_estate get pods          # watch the rollout
+#   kubectl -n real-estate get pods          # watch the rollout
 #
-# Everything lands in the `real_estate` namespace. Project images are named
+# Everything lands in the `real-estate` namespace. Project images are named
 # without a tag in the manifests; generated/ rewrites them to
 # DOCKERHUB_USER/<image>:IMAGE_TAG from .env. Third-party images follow docker-compose.yml: postgres and mlflow are pinned
 # in their own manifests, and so is RustFS (`rustfs/rustfs`).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: real_estate
+namespace: real-estate
 
 # Shared label on every object (metadata and pod templates, not selectors, so
 # adding or renaming it never breaks an existing Deployment/Service pairing).
@@ -30,6 +30,7 @@ resources:
   - base/rustfs
   - base/mlflow
   - base/postgres-train
+  - base/data-api
   - base/api-inference
   - base/frontend
   - base/postgres-airflow

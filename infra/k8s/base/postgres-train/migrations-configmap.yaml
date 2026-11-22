@@ -9,70 +9,199 @@
 # /database and sets MIGRATIONS_DIR=/database to match that flat layout.
 apiVersion: v1
 data:
-  001_create_data_contract.sql: |
+  001_raw_clean_audit.sql: |
+    -- Data domains of the real estate pipeline (training database).
+    --
+    --   raw    batches exactly as the Data API returned them, plus one row per
+    --          listing with its validation status. Never modified by preprocessing.
+    --   clean  typed, model-ready listings with lineage to RAW, training
+    --          eligibility and data split.
+    --   audit  one row per batch with every check, decision and MLflow identifier;
+    --          it is the training/promotion history shown in Streamlit.
+    --
+    -- Safe to re-run (IF NOT EXISTS everywhere).
+
     CREATE SCHEMA IF NOT EXISTS raw;
     CREATE SCHEMA IF NOT EXISTS clean;
-    CREATE SCHEMA IF NOT EXISTS inference;
+    CREATE SCHEMA IF NOT EXISTS audit;
 
-    CREATE TABLE IF NOT EXISTS raw.load_batches (
+    -- --------------------------------------------------------------------------
+    -- RAW · one row per Data API response (= one batch)
+    -- --------------------------------------------------------------------------
+    -- The Data API is stateful: every GET /data hands out the NEXT batch, so a
+    -- response that is lost after the call cannot be requested again. The body is
+    -- therefore persisted (gzip, byte-for-byte) by the fetch task before anything
+    -- else happens; the later tasks only read it from here.
+    CREATE TABLE IF NOT EXISTS raw.batches (
         batch_id UUID PRIMARY KEY,
-        source_file TEXT NOT NULL,
-        source_uri TEXT NOT NULL,
-        source_sha256 CHAR(64) NOT NULL,
-        batch_number INTEGER NOT NULL CHECK (batch_number > 0),
-        expected_record_count INTEGER NOT NULL
-            CHECK (expected_record_count BETWEEN 1 AND 15000),
-        loaded_record_count INTEGER NOT NULL DEFAULT 0
-            CHECK (loaded_record_count BETWEEN 0 AND 15000),
-        status TEXT NOT NULL DEFAULT 'pending'
-            CHECK (status IN ('pending', 'loading', 'completed', 'failed')),
-        started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        group_number INTEGER NOT NULL,
+        api_batch_number INTEGER NOT NULL,
+        request_url TEXT NOT NULL,
+        http_status INTEGER NOT NULL,
+        response_sha256 CHAR(64) NOT NULL,
+        response_bytes BIGINT NOT NULL CHECK (response_bytes > 0),
+        payload_gzip BYTEA NOT NULL,
+        record_count INTEGER NOT NULL CHECK (record_count >= 0),
+        -- Column -> JSON types observed in the response (validate_schema input).
+        received_schema JSONB,
+        -- landed: body persisted · stored: rows exploded into raw.records
+        -- failed: the rows could not be stored (error_message)
+        status TEXT NOT NULL DEFAULT 'landed'
+            CHECK (status IN ('landed', 'stored', 'failed')),
+        -- Lifecycle of the whole DAG for this batch. A batch that is not
+        -- `completed` is resumed by the next run before the API is called again.
+        pipeline_status TEXT NOT NULL DEFAULT 'in_progress'
+            CHECK (pipeline_status IN ('in_progress', 'completed', 'failed')),
+        dag_run_id TEXT NOT NULL,
+        received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        stored_at TIMESTAMPTZ,
         completed_at TIMESTAMPTZ,
         error_message TEXT,
-        CONSTRAINT uq_load_batches_source_batch
-            UNIQUE (source_sha256, batch_number),
-        CONSTRAINT ck_load_batches_completion
-            CHECK (
-                (status = 'completed' AND completed_at IS NOT NULL
-                    AND loaded_record_count = expected_record_count)
-                OR (status <> 'completed' AND completed_at IS NULL)
-            )
+        -- The same response twice (e.g. after the API restarted its counter) is the
+        -- same batch: it is detected and never reprocessed.
+        CONSTRAINT uq_batches_response UNIQUE (group_number, api_batch_number, response_sha256)
     );
 
+    CREATE INDEX IF NOT EXISTS ix_batches_pipeline_status
+        ON raw.batches (pipeline_status, received_at);
+
+    -- --------------------------------------------------------------------------
+    -- RAW · one row per listing of a batch, unmodified
+    -- --------------------------------------------------------------------------
     CREATE TABLE IF NOT EXISTS raw.records (
         raw_record_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-        batch_id UUID NOT NULL REFERENCES raw.load_batches (batch_id),
-        source_sha256 CHAR(64) NOT NULL,
-        source_row_number BIGINT NOT NULL CHECK (source_row_number > 0),
-        source_record_sha256 CHAR(64) NOT NULL,
+        batch_id UUID NOT NULL REFERENCES raw.batches (batch_id),
+        row_number INTEGER NOT NULL CHECK (row_number > 0),
+        -- Content hash (contract.record_key): finds exact duplicates across batches.
         record_key CHAR(64) NOT NULL,
         record_data JSONB NOT NULL CHECK (jsonb_typeof(record_data) = 'object'),
         status TEXT NOT NULL DEFAULT 'loaded'
             CHECK (status IN ('loaded', 'validated', 'rejected')),
+        status_reason TEXT,
         loaded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        CONSTRAINT uq_raw_source_row UNIQUE (source_sha256, source_row_number)
+        validated_at TIMESTAMPTZ,
+        CONSTRAINT uq_raw_records_batch_row UNIQUE (batch_id, row_number),
+        CONSTRAINT ck_raw_records_rejection_reason
+            CHECK (status <> 'rejected' OR status_reason IS NOT NULL)
     );
 
-    CREATE INDEX IF NOT EXISTS ix_raw_records_batch_id
-        ON raw.records (batch_id);
-    CREATE INDEX IF NOT EXISTS ix_raw_records_status
-        ON raw.records (status);
+    CREATE INDEX IF NOT EXISTS ix_raw_records_record_key ON raw.records (record_key);
+    CREATE INDEX IF NOT EXISTS ix_raw_records_status ON raw.records (status);
 
+    -- --------------------------------------------------------------------------
+    -- CLEAN · typed listings derived from validated RAW records
+    -- --------------------------------------------------------------------------
+    -- Columns hold the model INPUT contract (real_estate_model.contract) already
+    -- normalised: codes as text (ZIP with its leading zeros), numbers as double,
+    -- dates as date. Feature engineering happens inside the served model, so
+    -- training and inference share it. `street` is kept only for lineage/splits.
     CREATE TABLE IF NOT EXISTS clean.records (
         clean_record_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         raw_record_id BIGINT NOT NULL REFERENCES raw.records (raw_record_id),
+        batch_id UUID NOT NULL REFERENCES raw.batches (batch_id),
         transformation_version TEXT NOT NULL,
-        features JSONB NOT NULL CHECK (jsonb_typeof(features) = 'object'),
-        target_price DOUBLE PRECISION NOT NULL CHECK (target_price > 0),
-        data_split TEXT NOT NULL
-            CHECK (data_split IN ('train', 'validation', 'test')),
+        brokered_by TEXT,
+        status TEXT,
+        bed DOUBLE PRECISION,
+        bath DOUBLE PRECISION,
+        acre_lot DOUBLE PRECISION,
+        street TEXT,
+        city TEXT,
+        state TEXT,
+        zip_code TEXT,
+        house_size DOUBLE PRECISION,
+        prev_sold_date DATE,
+        price DOUBLE PRECISION NOT NULL CHECK (price > 0),
+        -- Valid but not usable for training (e.g. out_of_range_price); such rows
+        -- never get a split.
+        exclusion_reason TEXT,
+        data_split TEXT CHECK (data_split IN ('train', 'validation', 'test')),
         processed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        CONSTRAINT uq_clean_record_transform
-            UNIQUE (raw_record_id, transformation_version)
+        CONSTRAINT uq_clean_records_raw_version UNIQUE (raw_record_id, transformation_version),
+        CONSTRAINT ck_clean_records_split
+            CHECK ((exclusion_reason IS NULL) = (data_split IS NOT NULL))
     );
 
-    CREATE INDEX IF NOT EXISTS ix_clean_records_split_version
+    CREATE INDEX IF NOT EXISTS ix_clean_records_version_split
         ON clean.records (transformation_version, data_split);
+    CREATE INDEX IF NOT EXISTS ix_clean_records_batch ON clean.records (batch_id);
+
+    -- --------------------------------------------------------------------------
+    -- AUDIT · training and promotion history, one row per batch
+    -- --------------------------------------------------------------------------
+    -- Each DAG task fills its own columns as it finishes, so a failed run still
+    -- shows how far the batch got and why it stopped.
+    CREATE TABLE IF NOT EXISTS audit.batch_history (
+        batch_id UUID PRIMARY KEY REFERENCES raw.batches (batch_id),
+        group_number INTEGER NOT NULL,
+        api_batch_number INTEGER NOT NULL,
+        dag_run_id TEXT NOT NULL,
+        record_count INTEGER NOT NULL,
+        received_at TIMESTAMPTZ NOT NULL,
+        schema_report JSONB,
+        quality_report JSONB,
+        new_categories_report JSONB,
+        drift_report JSONB,
+        preprocessing_report JSONB,
+        training_decision TEXT CHECK (training_decision IN ('train', 'skip')),
+        training_reason TEXT,
+        training_rules JSONB,
+        mlflow_experiment_id TEXT,
+        mlflow_parent_run_id TEXT,
+        mlflow_candidate_run_id TEXT,
+        candidate_model TEXT,
+        candidate_version TEXT,
+        candidate_metrics JSONB,
+        production_version_before TEXT,
+        production_metrics JSONB,
+        metric_deltas JSONB,
+        promotion_decision TEXT CHECK (promotion_decision IN ('promoted', 'rejected')),
+        promotion_reason TEXT,
+        production_version_after TEXT,
+        final_status TEXT NOT NULL DEFAULT 'in_progress'
+            CHECK (final_status IN ('in_progress', 'completed', 'failed')),
+        error_message TEXT,
+        started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        finished_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS ix_batch_history_received
+        ON audit.batch_history (received_at DESC);
+
+    -- Readable history for Streamlit: one line per batch with the key outcomes.
+    CREATE OR REPLACE VIEW audit.batch_history_summary AS
+    SELECT
+        h.api_batch_number,
+        h.group_number,
+        h.received_at,
+        h.record_count,
+        (h.quality_report ->> 'validated_rows')::INTEGER AS validated_rows,
+        (h.preprocessing_report ->> 'eligible_rows')::INTEGER AS eligible_rows,
+        h.training_decision,
+        h.training_reason,
+        h.candidate_model,
+        h.candidate_version,
+        h.promotion_decision,
+        h.promotion_reason,
+        h.production_version_before,
+        h.production_version_after,
+        h.metric_deltas,
+        h.mlflow_experiment_id,
+        h.mlflow_parent_run_id,
+        h.mlflow_candidate_run_id,
+        h.final_status,
+        h.error_message,
+        h.dag_run_id,
+        h.batch_id,
+        h.finished_at
+    FROM audit.batch_history h
+    ORDER BY h.received_at;
+  002_inference_logs.sql: |
+    -- INFERENCE · one auditable event per request to the inference API (RF8).
+    -- Safe to re-run.
+
+    CREATE SCHEMA IF NOT EXISTS inference;
 
     CREATE TABLE IF NOT EXISTS inference.logs (
         request_id UUID PRIMARY KEY,
@@ -102,39 +231,6 @@ data:
         ON inference.logs (requested_at DESC);
     CREATE INDEX IF NOT EXISTS ix_inference_logs_model
         ON inference.logs (model_name, model_version);
-  002_incremental_pipeline.sql: |
-    -- Incremental pipeline: per-row RAW validation, CLEAN exclusions, split
-    -- assignment after storage, and a staging table between preprocessing and
-    -- the CLEAN merge. Safe to re-run.
-
-    ALTER TABLE raw.load_batches ADD COLUMN IF NOT EXISTS dag_run_id TEXT;
-
-    ALTER TABLE raw.records ADD COLUMN IF NOT EXISTS status_reason TEXT;
-    ALTER TABLE raw.records ADD COLUMN IF NOT EXISTS validated_at TIMESTAMPTZ;
-    ALTER TABLE raw.records DROP CONSTRAINT IF EXISTS ck_raw_records_rejection_reason;
-    ALTER TABLE raw.records ADD CONSTRAINT ck_raw_records_rejection_reason
-        CHECK (status <> 'rejected' OR status_reason IS NOT NULL);
-    CREATE INDEX IF NOT EXISTS ix_raw_records_record_key
-        ON raw.records (record_key);
-
-    -- A CLEAN row is either excluded from training (with a reason and no split)
-    -- or eligible; eligible rows get their split from the split task.
-    ALTER TABLE clean.records ADD COLUMN IF NOT EXISTS exclusion_reason TEXT;
-    ALTER TABLE clean.records ALTER COLUMN data_split DROP NOT NULL;
-    ALTER TABLE clean.records DROP CONSTRAINT IF EXISTS ck_clean_records_excluded_split;
-    ALTER TABLE clean.records ADD CONSTRAINT ck_clean_records_excluded_split
-        CHECK (exclusion_reason IS NULL OR data_split IS NULL);
-
-    CREATE TABLE IF NOT EXISTS clean.records_staging (
-        dag_run_id TEXT NOT NULL,
-        raw_record_id BIGINT NOT NULL REFERENCES raw.records (raw_record_id),
-        transformation_version TEXT NOT NULL,
-        features JSONB NOT NULL CHECK (jsonb_typeof(features) = 'object'),
-        target_price DOUBLE PRECISION NOT NULL CHECK (target_price > 0),
-        exclusion_reason TEXT,
-        staged_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (dag_run_id, raw_record_id, transformation_version)
-    );
   003_inference_feedback.sql: |
     -- Ground truth for inference requests: the observed price that turns an
     -- inference.logs row into a supervised training example. Safe to re-run.
@@ -169,6 +265,37 @@ data:
     FROM inference.logs AS l
     JOIN inference.feedback AS f ON f.request_id = l.request_id
     WHERE l.status = 'succeeded';
+  004_api_requests.sql: |
+    -- RAW · one row per attempt of fetch_batch_from_api, whatever its outcome.
+    --
+    -- raw.batches only holds responses that carried data. The project treats every
+    -- request to the Data API as a data event, so the runs that got nothing new
+    -- (end of data, empty batch, a batch already ingested, an API error) and the
+    -- runs that resumed an unfinished batch without calling the API are recorded
+    -- here too. Safe to re-run.
+
+    CREATE TABLE IF NOT EXISTS raw.api_requests (
+        request_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        dag_run_id TEXT NOT NULL,
+        requested_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        -- false when the run resumed an unfinished batch instead of calling the API.
+        api_called BOOLEAN NOT NULL,
+        request_url TEXT,
+        group_number INTEGER NOT NULL,
+        http_status INTEGER,
+        duration_ms DOUBLE PRECISION CHECK (duration_ms IS NULL OR duration_ms >= 0),
+        -- new | resumed | duplicate | empty | end_of_data | error
+        outcome TEXT NOT NULL
+            CHECK (outcome IN ('new', 'resumed', 'duplicate', 'empty', 'end_of_data', 'error')),
+        api_batch_number INTEGER,
+        batch_id UUID REFERENCES raw.batches (batch_id),
+        response_sha256 CHAR(64),
+        record_count INTEGER CHECK (record_count IS NULL OR record_count >= 0),
+        detail TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS ix_api_requests_requested_at
+        ON raw.api_requests (requested_at DESC);
   migrate.sh: |
     #!/bin/sh
     # Apply pending SQL migrations to the training database, in file-name order.

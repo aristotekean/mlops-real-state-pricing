@@ -1,0 +1,66 @@
+# Data API of the course (external source, NOT developed by the team): serves
+# the real estate listings of each group in batches, one batch per GET /data.
+#
+# The image is the one published by the instructor, pinned by tag, and only
+# exists for linux/amd64 (it runs under emulation on Apple Silicon nodes).
+#
+# The batch counter lives in the process memory, so the API must not be
+# scaled or restarted casually: one replica, Recreate strategy, and a liveness
+# probe that only restarts a hung server. A restart starts the group from
+# batch 0 again; the DAG detects those repeated batches (same number and
+# SHA-256) and does not reprocess them.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-api
+  labels:
+    app.kubernetes.io/name: data-api
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: data-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: data-api
+    spec:
+      containers:
+        - name: data-api
+          image: cristiandiaz13/mlops-puj:data-api-pf-v2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+          # The largest batch of a group is ~360k rows (~90 MB of JSON built in
+          # memory per request).
+          resources:
+            requests:
+              cpu: 250m
+              memory: 768Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+          # Generous: serialising a large batch can keep the single worker
+          # busy for a while, and a restart resets the batch counter.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 10

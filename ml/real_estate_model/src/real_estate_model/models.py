@@ -19,6 +19,7 @@ from sklearn.metrics import (
 from sklearn.model_selection import KFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (
+    FunctionTransformer,
     OneHotEncoder,
     OrdinalEncoder,
     StandardScaler,
@@ -43,11 +44,53 @@ PRIMARY_METRIC = "validation_rmsle"
 PRIMARY_METRIC_GREATER_IS_BETTER = False
 
 
+# Base metric name -> whether a higher value is better. Every metric reported by
+# ``evaluate_predictions`` is listed, so the pipeline can pick any of them as
+# its selection or promotion metric.
+METRIC_GREATER_IS_BETTER = {
+    "rmsle": False,
+    "rmse": False,
+    "mae": False,
+    "median_ae": False,
+    "mape": False,
+    "r2": True,
+}
+
+# Upper bound of a prediction in log1p(price) space (exp(21) ~ 1.3 billion USD).
+# Clipping before expm1 keeps an absurd input from producing an infinite price.
+MAX_LOG_PRICE = 21.0
+
+
 def is_better(candidate: float, reference: float) -> bool:
     """Return whether ``candidate`` beats ``reference`` on the primary metric."""
     if PRIMARY_METRIC_GREATER_IS_BETTER:
         return candidate > reference
     return candidate < reference
+
+
+def metric_greater_is_better(metric: str) -> bool:
+    """Direction of a metric given as ``mae`` or with a split prefix (``validation_mae``)."""
+    for name, greater in METRIC_GREATER_IS_BETTER.items():
+        if metric == name or metric.endswith(f"_{name}"):
+            return greater
+    raise ValueError(f"Unknown metric: {metric}")
+
+
+def relative_improvement(candidate: float, reference: float, metric: str) -> float:
+    """Signed relative gain of ``candidate`` over ``reference``; positive is better.
+
+    For an error metric 0.06 means the error is 6% lower; for R2 it is the
+    relative increase. A zero reference gives 0 (no meaningful ratio).
+    """
+    if reference == 0:
+        return 0.0
+    gain = (candidate - reference) if metric_greater_is_better(metric) else (reference - candidate)
+    return float(gain / abs(reference))
+
+
+def price_from_log(values: Any) -> Any:
+    """Inverse of log1p with the prediction clipped to a plausible price range."""
+    return np.expm1(np.clip(values, 0.0, MAX_LOG_PRICE))
 
 
 def _impute_category() -> SimpleImputer:
@@ -66,6 +109,9 @@ def _preprocessor(
             ("imputer", SimpleImputer(strategy="median", keep_empty_features=True))
         )
     if scale:
+        # Linear models only: sizes and lot areas are heavy-tailed, so they
+        # enter in log scale (all numeric features are non-negative).
+        numeric_steps.append(("log1p", FunctionTransformer(np.log1p, feature_names_out="one-to-one")))
         numeric_steps.append(("scaler", StandardScaler()))
 
     if one_hot:
@@ -160,7 +206,8 @@ def build_candidate(name: str) -> Pipeline:
     model = TransformedTargetRegressor(
         regressor=Pipeline([("preprocessor", preprocessor), ("regressor", regressor)]),
         func=np.log1p,
-        inverse_func=np.expm1,
+        inverse_func=price_from_log,
+        check_inverse=False,
     )
     return Pipeline([("model", model)])
 

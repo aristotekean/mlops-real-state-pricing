@@ -1,259 +1,170 @@
-"""RAW -> staging -> CLEAN processing and patient-level split assignment."""
+"""CLEAN layer: typed, model-ready listings with lineage to RAW."""
 
-import hashlib
-import json
+from collections import Counter
 from typing import Any
 
-from airflow.sdk.exceptions import AirflowFailException
 from sqlalchemy import text
 
 from real_estate_model.contract import (
-    PATIENT_COLUMN,
-    TARGET_CLASSES,
-    TARGET_COLUMN,
+    SOURCE_COLUMNS,
     exclusion_reason,
-    input_frame,
-)
-from real_estate_model.features import (
-    TRANSFORMATION_VERSION,
-    engineer_features,
-    features_to_json,
+    normalize_value,
+    split_key,
 )
 from real_estate_model.splits import SPLIT_NAMES, SPLIT_SALT, assign_split
-from real_estate_pipeline.settings import MAX_BATCH_SIZE, database_engine
+from real_estate_pipeline import history, settings
+from real_estate_pipeline.db import copy_rows, engine_scope
+from real_estate_pipeline.validation import _conformed
+
+CLEAN_COLUMNS = (
+    "raw_record_id", "batch_id", "transformation_version",
+    "brokered_by", "status", "bed", "bath", "acre_lot", "street", "city", "state",
+    "zip_code", "house_size", "prev_sold_date", "price",
+    "exclusion_reason", "data_split",
+)
+_VALUE_COLUMNS = CLEAN_COLUMNS[3:]  # updated on conflict
 
 
-def preprocess_to_staging(dag_run_id: str) -> dict[str, Any]:
-    """Transform validated RAW records missing from CLEAN into the staging table.
+def _process_batch(engine: Any, batch_id: str) -> dict[str, Any]:
+    """Upsert one batch's validated RAW rows into CLEAN under CLEAN_VERSION.
 
-    Reads RAW (never the CSV), applies the shared ``readmission-features-v2``
-    rules in chunks of at most 15,000 records, and keeps excluded encounters
-    with their reason so every validated record is accounted for in CLEAN.
+    Upsert instead of delete+insert keeps `clean_record_id` stable when a batch
+    is reprocessed, so lineage and snapshots recorded earlier stay valid. Rows
+    of the batch that are no longer validated are removed.
     """
-    select_pending = text(
-        """
-        SELECT r.raw_record_id, r.record_data
-        FROM raw.records r
-        WHERE r.status = 'validated'
-          AND r.raw_record_id > :after_id
-          AND NOT EXISTS (
-              SELECT 1 FROM clean.records c
-              WHERE c.raw_record_id = r.raw_record_id
-                AND c.transformation_version = :transformation_version
-          )
-        ORDER BY r.raw_record_id
-        LIMIT :limit
-        """
-    )
-    insert_staging = text(
-        """
-        INSERT INTO clean.records_staging (
-            dag_run_id, raw_record_id, transformation_version, features,
-            target_readmitted, exclusion_reason
-        )
-        VALUES (
-            :dag_run_id, :raw_record_id, :transformation_version,
-            CAST(:features AS jsonb), :target_readmitted, :exclusion_reason
-        )
-        """
-    )
-    staged = excluded = 0
-    last_id = 0
-    engine = database_engine()
-    try:
-        with engine.begin() as connection:
-            connection.execute(
-                text("DELETE FROM clean.records_staging WHERE dag_run_id = :dag_run_id"),
-                {"dag_run_id": dag_run_id},
+    with engine.connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT raw_record_id, record_data FROM raw.records
+                WHERE batch_id = :id AND status = 'validated' ORDER BY row_number
+                """
+            ),
+            {"id": batch_id},
+        ).all()
+
+    excluded: Counter[str] = Counter()
+    splits: Counter[str] = Counter()
+    values = []
+    for raw_record_id, data in rows:
+        record = _conformed(data)
+        reason = exclusion_reason(record, settings.TRAINING_BOUNDS)
+        split = None if reason else assign_split(split_key(record))
+        if reason:
+            excluded.update(reason.split(";"))
+        else:
+            splits[split] += 1
+        normalized = {column: normalize_value(column, record[column]) for column in SOURCE_COLUMNS}
+        values.append(
+            (
+                raw_record_id, batch_id, settings.CLEAN_VERSION,
+                *(normalized[column] for column in CLEAN_COLUMNS[3:15]),
+                reason, split,
             )
-        while True:
-            with engine.begin() as connection:
-                rows = connection.execute(
-                    select_pending,
-                    {
-                        "after_id": last_id,
-                        "transformation_version": TRANSFORMATION_VERSION,
-                        "limit": MAX_BATCH_SIZE,
-                    },
-                ).mappings().all()
-                if not rows:
-                    break
-                records = [row["record_data"] for row in rows]
-                features = features_to_json(engineer_features(input_frame(records)))
-                values = []
-                for row, record, feature_values in zip(rows, records, features, strict=True):
-                    reason = exclusion_reason(record)
-                    excluded += reason is not None
-                    values.append(
-                        {
-                            "dag_run_id": dag_run_id,
-                            "raw_record_id": row["raw_record_id"],
-                            "transformation_version": TRANSFORMATION_VERSION,
-                            "features": json.dumps(feature_values, allow_nan=False),
-                            "target_readmitted": record[TARGET_COLUMN],
-                            "exclusion_reason": reason,
-                        }
-                    )
-                connection.execute(insert_staging, values)
-                staged += len(values)
-                last_id = rows[-1]["raw_record_id"]
-    finally:
-        engine.dispose()
-    return {
-        "transformation_version": TRANSFORMATION_VERSION,
-        "staged_rows": staged,
-        "excluded_rows": excluded,
-    }
+        )
+
+    columns = ", ".join(CLEAN_COLUMNS)
+    updates = ", ".join(f"{column} = EXCLUDED.{column}" for column in _VALUE_COLUMNS)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TEMP TABLE tmp_clean ON COMMIT DROP AS "
+                f"SELECT {columns} FROM clean.records WITH NO DATA"
+            )
+        )
+        copy_rows(connection, "tmp_clean", CLEAN_COLUMNS, values)
+        connection.execute(
+            text(
+                f"""
+                INSERT INTO clean.records ({columns})
+                SELECT {columns} FROM tmp_clean
+                ON CONFLICT (raw_record_id, transformation_version) DO UPDATE
+                SET {updates}, processed_at = CURRENT_TIMESTAMP
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                DELETE FROM clean.records c
+                WHERE c.batch_id = :id AND c.transformation_version = :v
+                  AND NOT EXISTS (SELECT 1 FROM tmp_clean t WHERE t.raw_record_id = c.raw_record_id)
+                """
+            ),
+            {"id": batch_id, "v": settings.CLEAN_VERSION},
+        )
+    return {"rows": len(values), "splits": splits, "excluded": excluded}
 
 
-def merge_staging_into_clean(dag_run_id: str) -> dict[str, Any]:
-    """Atomically upsert this run's staged rows into CLEAN and clear staging."""
-    engine = database_engine()
-    try:
-        with engine.begin() as connection:
-            merged = connection.execute(
+def preprocess_data(batch: dict[str, Any]) -> dict[str, Any]:
+    """Transform the batch's validated RAW rows into clean.records.
+
+    * values normalised to the contract types (codes as text, ZIP codes with
+      their leading zeros, numbers as double, dates as date);
+    * rows outside TRAINING_BOUNDS keep an ``exclusion_reason`` and no split;
+    * eligible rows get a deterministic, property-level split (salted hash of
+      street+city+state+zip), so a property never straddles train and test and
+      earlier assignments never change when new batches arrive.
+
+    Earlier batches missing under the current CLEAN_VERSION (the training
+    bounds changed) are rebuilt first, so CLEAN is always consistent.
+    Idempotent: re-running upserts the same rows.
+    """
+    batch_id = batch["batch_id"]
+    with engine_scope() as engine:
+        with engine.connect() as connection:
+            backfill = connection.execute(
                 text(
                     """
-                    INSERT INTO clean.records (
-                        raw_record_id, transformation_version, features,
-                        target_readmitted, exclusion_reason
-                    )
-                    SELECT raw_record_id, transformation_version, features,
-                           target_readmitted, exclusion_reason
-                    FROM clean.records_staging
-                    WHERE dag_run_id = :dag_run_id
-                    ON CONFLICT (raw_record_id, transformation_version) DO UPDATE SET
-                        features = EXCLUDED.features,
-                        target_readmitted = EXCLUDED.target_readmitted,
-                        exclusion_reason = EXCLUDED.exclusion_reason,
-                        data_split = CASE
-                            WHEN EXCLUDED.exclusion_reason IS NULL
-                                THEN clean.records.data_split
-                        END,
-                        processed_at = CURRENT_TIMESTAMP
+                    SELECT b.batch_id::text FROM raw.batches b
+                    WHERE b.batch_id <> :id AND b.status = 'stored'
+                      AND EXISTS (SELECT 1 FROM raw.records r
+                                  WHERE r.batch_id = b.batch_id AND r.status = 'validated')
+                      AND NOT EXISTS (SELECT 1 FROM clean.records c
+                                      WHERE c.batch_id = b.batch_id AND c.transformation_version = :v)
+                    ORDER BY b.received_at
                     """
                 ),
-                {"dag_run_id": dag_run_id},
-            ).rowcount
-            connection.execute(
-                text("DELETE FROM clean.records_staging WHERE dag_run_id = :dag_run_id"),
-                {"dag_run_id": dag_run_id},
-            )
+                {"id": batch_id, "v": settings.CLEAN_VERSION},
+            ).scalars().all()
+        for other in backfill:
+            stats = _process_batch(engine, other)
+            print(f"Rebuilt earlier batch {other} under {settings.CLEAN_VERSION}: {stats['rows']} rows")
+
+        stats = _process_batch(engine, batch_id)
+        with engine.connect() as connection:
             totals = connection.execute(
                 text(
                     """
-                    SELECT COUNT(*) AS total_rows,
-                           COUNT(*) FILTER (WHERE exclusion_reason IS NULL) AS eligible_rows
-                    FROM clean.records
-                    WHERE transformation_version = :transformation_version
+                    SELECT data_split, COUNT(*) FROM clean.records
+                    WHERE transformation_version = :v AND data_split IS NOT NULL
+                    GROUP BY data_split
                     """
                 ),
-                {"transformation_version": TRANSFORMATION_VERSION},
-            ).mappings().one()
-    finally:
-        engine.dispose()
-    return {
-        "merged_rows": merged,
-        "clean_total_rows": totals["total_rows"],
-        "clean_eligible_rows": totals["eligible_rows"],
-    }
+                {"v": settings.CLEAN_VERSION},
+            ).all()
 
-
-def assign_and_check_splits() -> dict[str, Any]:
-    """Assign splits to new eligible CLEAN rows and verify the full partition.
-
-    The split comes from a salted hash of ``patient_nbr`` (read from RAW
-    lineage), so it never changes for rows assigned in earlier runs. Fails if a
-    patient appears in more than one split.
-    """
-    engine = database_engine()
-    try:
-        with engine.begin() as connection:
-            unassigned = connection.execute(
-                text(
-                    """
-                    SELECT c.clean_record_id, r.record_data ->> :patient_column AS patient_id
-                    FROM clean.records c
-                    JOIN raw.records r ON r.raw_record_id = c.raw_record_id
-                    WHERE c.transformation_version = :transformation_version
-                      AND c.exclusion_reason IS NULL
-                      AND c.data_split IS NULL
-                    """
-                ),
-                {
-                    "patient_column": PATIENT_COLUMN,
-                    "transformation_version": TRANSFORMATION_VERSION,
-                },
-            ).mappings().all()
-            if unassigned:
-                connection.execute(
-                    text(
-                        """
-                        UPDATE clean.records SET data_split = :data_split
-                        WHERE clean_record_id = :clean_record_id
-                        """
-                    ),
-                    [
-                        {
-                            "clean_record_id": row["clean_record_id"],
-                            "data_split": assign_split(row["patient_id"]),
-                        }
-                        for row in unassigned
-                    ],
-                )
-
-            leaked_patients = connection.execute(
-                text(
-                    """
-                    SELECT COUNT(*) FROM (
-                        SELECT r.record_data ->> :patient_column
-                        FROM clean.records c
-                        JOIN raw.records r ON r.raw_record_id = c.raw_record_id
-                        WHERE c.transformation_version = :transformation_version
-                          AND c.data_split IS NOT NULL
-                        GROUP BY 1
-                        HAVING COUNT(DISTINCT c.data_split) > 1
-                    ) leaked
-                    """
-                ),
-                {
-                    "patient_column": PATIENT_COLUMN,
-                    "transformation_version": TRANSFORMATION_VERSION,
-                },
-            ).scalar_one()
-            counts = connection.execute(
-                text(
-                    """
-                    SELECT data_split, target_readmitted, COUNT(*) AS rows,
-                           MAX(clean_record_id) AS max_id
-                    FROM clean.records
-                    WHERE transformation_version = :transformation_version
-                      AND data_split IS NOT NULL
-                    GROUP BY data_split, target_readmitted
-                    """
-                ),
-                {"transformation_version": TRANSFORMATION_VERSION},
-            ).mappings().all()
-    finally:
-        engine.dispose()
-
-    if leaked_patients:
-        raise AirflowFailException(
-            f"{leaked_patients} patients appear in more than one data split."
-        )
-    split_counts = {
-        split: {label: 0 for label in TARGET_CLASSES} for split in SPLIT_NAMES
-    }
-    for row in counts:
-        split_counts[row["data_split"]][row["target_readmitted"]] = row["rows"]
-    snapshot = {
-        "transformation_version": TRANSFORMATION_VERSION,
+    splits, excluded = stats["splits"], stats["excluded"]
+    accumulated = {split: 0 for split in SPLIT_NAMES} | dict(totals)
+    report = {
+        "transformation_version": settings.CLEAN_VERSION,
         "split_salt": SPLIT_SALT,
-        "rows": sum(row["rows"] for row in counts),
-        "max_clean_record_id": max((row["max_id"] for row in counts), default=0),
-        "split_counts": split_counts,
+        "clean_rows": stats["rows"],
+        "eligible_rows": sum(splits.values()),
+        "excluded_rows": stats["rows"] - sum(splits.values()),
+        "exclusion_reasons": dict(excluded),
+        "batch_split_rows": {split: splits.get(split, 0) for split in SPLIT_NAMES},
+        "accumulated_split_rows": accumulated,
+        "accumulated_eligible_rows": sum(accumulated.values()),
+        "rebuilt_batches": list(backfill),
     }
-    snapshot["fingerprint"] = hashlib.sha256(
-        json.dumps(snapshot, sort_keys=True).encode("utf-8")
-    ).hexdigest()[:16]
-    return {"assigned_rows": len(unassigned), "snapshot": snapshot}
+    history.update(batch_id, preprocessing_report=report)
+    print(
+        f"CLEAN {settings.CLEAN_VERSION}: {report['clean_rows']} rows ({report['eligible_rows']} eligible, "
+        f"{report['excluded_rows']} excluded {dict(excluded)}); accumulated {accumulated}; "
+        f"rebuilt {len(backfill)} earlier batches"
+    )
+    return {
+        "eligible_rows": report["eligible_rows"],
+        "accumulated_split_rows": accumulated,
+    }

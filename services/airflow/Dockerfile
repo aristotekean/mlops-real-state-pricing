@@ -14,18 +14,9 @@ USER root
 
 COPY services/airflow/requirements.txt /tmp/requirements.txt
 COPY ml/real_estate_model /tmp/real-estate-model
-COPY scripts /opt/airflow/scripts
-# DAGs are baked in so a Kubernetes deployment needs no bind mount; the local
-# compose still mounts services/airflow/dags over this copy for fast iteration.
-COPY services/airflow/dags /opt/airflow/dags
-RUN chown -R airflow:root /tmp/real-estate-model /tmp/requirements.txt \
-    /opt/airflow/scripts /opt/airflow/dags
+RUN chown -R airflow:root /tmp/real-estate-model /tmp/requirements.txt
 
 USER airflow
-
-# Airflow only adds dags/, config/ and plugins/ to sys.path; the repo-root
-# scripts package copied above lives in /opt/airflow, so expose it explicitly.
-ENV PYTHONPATH=/opt/airflow
 
 # Re-stating apache-airflow pins its version so pip cannot upgrade or
 # downgrade it while resolving the DAG dependencies.
@@ -33,3 +24,13 @@ RUN pip install --no-cache-dir \
     "apache-airflow==${AIRFLOW_VERSION}" \
     -r /tmp/requirements.txt \
     /tmp/real-estate-model
+
+# DAGs are baked in so a Kubernetes deployment needs no bind mount; the local
+# compose still mounts services/airflow/dags over this copy for fast iteration.
+# Copied after the dependencies so a DAG change does not reinstall them.
+COPY --chown=airflow:root services/airflow/dags /opt/airflow/dags
+
+# Code version logged with every MLflow training run (RF5). CI passes the
+# commit SHA: docker build --build-arg GIT_COMMIT=$GITHUB_SHA ...
+ARG GIT_COMMIT=unknown
+ENV GIT_COMMIT=${GIT_COMMIT}
