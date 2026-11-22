@@ -6,8 +6,16 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from real_estate_model.contract import INPUT_COLUMNS, NUMERIC_INPUTS, TARGET_CLASSES
-from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, StrictStr, create_model
+from real_estate_model.contract import INPUT_COLUMNS, NUMERIC_INPUTS
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    create_model,
+)
 
 
 class HealthResponse(BaseModel):
@@ -26,7 +34,6 @@ class ModelInfoResponse(BaseModel):
     last_check_at: datetime | None
     last_error: str | None
     refresh_seconds: float
-    classes: list[str] | None
     tracking_uri: str | None
 
 
@@ -45,7 +52,8 @@ class ErrorDetail(BaseModel):
 # /predict
 # --------------------------------------------------------------------------- #
 def _python_name(column: str) -> str:
-    """Contract keys such as ``glyburide-metformin`` are not identifiers."""
+    """Contract keys are used verbatim as field aliases; the Python attribute
+    name only needs to be a valid identifier (no hyphens)."""
     return column.replace("-", "_")
 
 
@@ -66,9 +74,10 @@ def _feature_fields() -> dict[str, Any]:
     return fields
 
 
-# All 44 contract inputs, built from the shared contract so the API and the
-# training pipeline cannot drift. Identifiers, the target and the excluded
-# columns are unknown keys here and therefore rejected (``extra="forbid"``).
+# Every model input of the real estate contract, built from the shared contract
+# so the API and the training pipeline cannot drift. The target (``price``),
+# ``street`` and any other source column are unknown keys here and therefore
+# rejected (``extra="forbid"``).
 PredictFeatures = create_model(
     "PredictFeatures",
     __config__=ConfigDict(extra="forbid", populate_by_name=False),
@@ -97,8 +106,8 @@ class ModelIdentity(BaseModel):
 
 class PredictResponse(BaseModel):
     request_id: UUID
-    prediction: str
-    probabilities: dict[str, float] | None
+    # The estimated listing price (the regression target), a JSON number.
+    prediction: float
     model: ModelIdentity
     processing_time_ms: float
 
@@ -106,26 +115,62 @@ class PredictResponse(BaseModel):
 # --------------------------------------------------------------------------- #
 # /predict/{request_id}/feedback
 # --------------------------------------------------------------------------- #
-ReadmittedLabel = Literal[TARGET_CLASSES]  # type: ignore[valid-type]
-
-
 class FeedbackRequest(BaseModel):
     """Observed outcome for a request already stored in ``inference.logs``."""
 
     model_config = ConfigDict(extra="forbid")
 
-    readmitted: ReadmittedLabel = Field(
-        description="Observed readmission outcome; same domain as the training target."
+    price: float = Field(
+        gt=0, description="Observed sale/listing price; same domain as the training target."
     )
     source: str | None = Field(
-        default=None, max_length=200, description="Free-text origin of the label (EHR, audit...)."
+        default=None, max_length=200, description="Free-text origin of the label (MLS, audit...)."
     )
 
 
 class FeedbackResponse(BaseModel):
     request_id: UUID
-    readmitted: ReadmittedLabel
-    prediction: str | None = Field(
-        description="Label the model returned for this request; null when it failed to score."
+    price: float
+    prediction: float | None = Field(
+        description="Price the model returned for this request; null when it failed to score."
     )
     created: bool = Field(description="False when a previous label was replaced.")
+
+
+# --------------------------------------------------------------------------- #
+# /history  (RF9 · training and promotion log shown in Streamlit)
+# --------------------------------------------------------------------------- #
+class BatchHistoryEntry(BaseModel):
+    """One row of ``audit.batch_history_summary``: the outcome of one batch.
+
+    ``extra="allow"`` keeps the API tolerant to columns the pipeline may add to
+    the audit view without forcing a redeploy of the inference service.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    api_batch_number: int | None = None
+    group_number: int | None = None
+    received_at: datetime | None = None
+    record_count: int | None = None
+    validated_rows: int | None = None
+    eligible_rows: int | None = None
+    training_decision: str | None = None
+    training_reason: str | None = None
+    candidate_model: str | None = None
+    candidate_version: str | None = None
+    promotion_decision: str | None = None
+    promotion_reason: str | None = None
+    production_version_before: str | None = None
+    production_version_after: str | None = None
+    metric_deltas: dict[str, Any] | None = None
+    mlflow_experiment_id: str | None = None
+    mlflow_parent_run_id: str | None = None
+    mlflow_candidate_run_id: str | None = None
+    final_status: str | None = None
+    error_message: str | None = None
+    finished_at: datetime | None = None
+
+
+class HistoryResponse(BaseModel):
+    entries: list[BatchHistoryEntry]

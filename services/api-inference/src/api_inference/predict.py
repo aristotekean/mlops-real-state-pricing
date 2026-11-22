@@ -141,7 +141,6 @@ def build_router(
             status="succeeded",
             requested_at=requested_at,
             prediction=result.prediction,
-            probabilities=result.probabilities,
             model_name=result.model.name,
             model_version=result.model.version,
             model_alias=result.model.alias,
@@ -151,7 +150,6 @@ def build_router(
         return PredictResponse(
             request_id=request_id,
             prediction=result.prediction,
-            probabilities=result.probabilities,
             model=ModelIdentity(
                 name=result.model.name, version=result.model.version, alias=result.model.alias
             ),
@@ -176,7 +174,7 @@ def build_router(
                 )
             created = await repository.upsert_feedback(
                 FeedbackRecord(
-                    request_id=request_id, readmitted=payload.readmitted, source=payload.source
+                    request_id=request_id, price=payload.price, source=payload.source
                 )
             )
         except Exception:
@@ -189,7 +187,7 @@ def build_router(
             )
         return FeedbackResponse(
             request_id=request_id,
-            readmitted=payload.readmitted,
+            price=payload.price,
             prediction=logged.prediction,
             created=created,
         )

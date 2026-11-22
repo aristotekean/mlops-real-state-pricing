@@ -1,7 +1,7 @@
 [project]
 name = "api-inference"
 version = "0.1.0"
-description = "FastAPI inference service for the diabetes readmission model"
+description = "FastAPI inference service for the real estate price model"
 readme = "README.md"
 authors = [
     { name = "aristotekean", email = "kean.solano@gmail.com" }

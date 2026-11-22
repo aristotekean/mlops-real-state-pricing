@@ -38,36 +38,36 @@ class FakeSession:
 
 def test_parse_validation_errors_collapses_union_members():
     detail = [
-        {"loc": ["body", "features", "time_in_hospital", "float"], "msg": "not a number"},
-        {"loc": ["body", "features", "time_in_hospital", "int"], "msg": "not an integer"},
-        {"loc": ["body", "features", "patient_nbr"], "msg": "Extra inputs are not permitted"},
+        {"loc": ["body", "features", "house_size", "float"], "msg": "not a number"},
+        {"loc": ["body", "features", "house_size", "int"], "msg": "not an integer"},
+        {"loc": ["body", "features", "price"], "msg": "Extra inputs are not permitted"},
         {"loc": ["body", "features"], "msg": "Field required"},
     ]
     assert parse_validation_errors(detail) == [
-        ("time_in_hospital", "not a number"),
-        ("patient_nbr", "Extra inputs are not permitted"),
+        ("house_size", "not a number"),
+        ("price", "Extra inputs are not permitted"),
         ("body", "Field required"),
     ]
 
 
 def test_predict_wraps_features_and_returns_payload():
-    session = FakeSession(FakeResponse(200, {"prediction": "NO"}))
+    session = FakeSession(FakeResponse(200, {"prediction": 350_000.0}))
     client = ApiClient("http://api:8000/", session=session)
-    assert client.predict({"age": "[60-70)"}) == {"prediction": "NO"}
-    assert session.calls == [("http://api:8000/predict", {"features": {"age": "[60-70)"}})]
+    assert client.predict({"bed": 3}) == {"prediction": 350_000.0}
+    assert session.calls == [("http://api:8000/predict", {"features": {"bed": 3}})]
 
 
 def test_predict_422_exposes_field_errors_and_request_id():
     payload = {
         "request_id": "abc",
-        "detail": [{"loc": ["body", "features", "age"], "msg": "Field required"}],
+        "detail": [{"loc": ["body", "features", "status"], "msg": "Field required"}],
     }
     client = ApiClient("http://api", session=FakeSession(FakeResponse(422, payload)))
     with pytest.raises(ApiError) as caught:
         client.predict({})
     assert caught.value.status_code == 422
     assert caught.value.request_id == "abc"
-    assert caught.value.field_errors == [("age", "Field required")]
+    assert caught.value.field_errors == [("status", "Field required")]
 
 
 def test_predict_503_uses_api_message():
@@ -84,3 +84,22 @@ def test_connection_errors_become_api_errors():
         client.predict({})
     with pytest.raises(ApiError):
         client.health()
+
+
+def test_history_returns_entries_list():
+    entries = [{"api_batch_number": 1, "training_decision": "train"}]
+    session = FakeSession(FakeResponse(200, {"entries": entries}))
+    client = ApiClient("http://api:8000", session=session)
+    assert client.history(limit=50) == entries
+    assert session.calls == [("http://api:8000/history?limit=50", None)]
+
+
+def test_history_missing_entries_is_empty_list():
+    client = ApiClient("http://api", session=FakeSession(FakeResponse(200, {})))
+    assert client.history() == []
+
+
+def test_history_http_error_raises_api_error():
+    client = ApiClient("http://api", session=FakeSession(FakeResponse(503, {})))
+    with pytest.raises(ApiError):
+        client.history()

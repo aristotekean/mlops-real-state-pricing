@@ -52,7 +52,6 @@ async def test_model_info_when_ready(running_client):
     assert body["run_id"] == "run-3"
     assert body["loaded_at"] is not None
     assert body["refresh_seconds"] == 0
-    assert body["classes"] == ["<30", ">30", "NO"]
 
 
 async def test_model_info_when_unavailable(running_client):
@@ -71,7 +70,7 @@ async def test_reload_swaps_to_new_alias_version(running_client):
     app, registry, _, _ = make_app()
     client = await running_client(app)
     registry.version = "4"
-    registry.model = FakeModel(label="<30")
+    registry.model = FakeModel(price=400_000.0)
 
     response = await client.post("/model/reload")
 
@@ -139,4 +138,4 @@ async def test_predict_before_load_raises_not_loaded():
     service = make_service(FakeRegistry(), make_settings())
 
     with pytest.raises(ModelNotLoadedError):
-        await service.predict({"age": "[70-80)"})
+        await service.predict({"bed": 3})

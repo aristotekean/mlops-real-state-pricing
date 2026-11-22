@@ -11,7 +11,7 @@ from conftest import FakeModel, FakeRegistry, InMemoryRepository, make_app, vali
 
 
 async def test_predict_success_returns_contract_and_logs_row(running_client):
-    app, _, repository, _ = make_app()
+    app, _, repository, _ = make_app(registry=FakeRegistry(model=FakeModel(price=425_000.0)))
     client = await running_client(app)
     request_id = str(uuid.uuid4())
     features = valid_features()
@@ -21,8 +21,8 @@ async def test_predict_success_returns_contract_and_logs_row(running_client):
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["request_id"] == request_id
-    assert body["prediction"] == "NO"
-    assert body["probabilities"] == {"<30": 0.05, ">30": 0.15, "NO": 0.8}
+    assert body["prediction"] == 425_000.0
+    assert "probabilities" not in body
     assert body["model"] == {"name": "real_estate", "version": "3", "alias": "production"}
     assert body["processing_time_ms"] >= 0
 
@@ -31,8 +31,7 @@ async def test_predict_success_returns_contract_and_logs_row(running_client):
     assert str(row.request_id) == request_id
     assert row.status == "succeeded"
     assert row.input_data == features  # exact submitted object
-    assert row.prediction == "NO"
-    assert row.probabilities == {"<30": 0.05, ">30": 0.15, "NO": 0.8}
+    assert row.prediction == 425_000.0
     assert (row.model_name, row.model_version, row.model_alias) == ("real_estate", "3", "production")
     assert row.processing_time_ms == body["processing_time_ms"]
     assert row.error_code is None
@@ -53,18 +52,20 @@ async def test_predict_feeds_normalised_frame_to_model(running_client):
     model = FakeModel()
     app, _, _, _ = make_app(registry=FakeRegistry(model=model))
     client = await running_client(app)
+    features = valid_features()
+    features["city"] = None  # a missing categorical becomes JSON null
 
-    await client.post("/predict", json={"features": valid_features()})
+    await client.post("/predict", json={"features": features})
 
     frame = model.frames[0]
     assert list(frame.columns) == list(INPUT_COLUMNS)
     assert len(frame) == 1
-    assert frame.loc[0, "time_in_hospital"] == 6.0
-    assert frame.loc[0, "payer_code"] is None
+    assert frame.loc[0, "bed"] == 3.0
+    assert frame.loc[0, "city"] is None
 
 
-@pytest.mark.parametrize("extra_key", ["encounter_id", "patient_nbr", "readmitted", "weight", "examide", "citoglipton", "unknown_field"])
-async def test_predict_rejects_identifiers_and_unknown_keys(running_client, extra_key):
+@pytest.mark.parametrize("extra_key", ["price", "street", "patient_nbr", "unknown_field"])
+async def test_predict_rejects_target_and_unknown_keys(running_client, extra_key):
     app, _, repository, _ = make_app()
     client = await running_client(app)
     features = valid_features()
@@ -87,7 +88,7 @@ async def test_predict_rejects_missing_feature(running_client):
     app, _, repository, _ = make_app()
     client = await running_client(app)
     features = valid_features()
-    del features["insulin"]
+    del features["bed"]
 
     response = await client.post("/predict", json={"features": features})
 
@@ -100,11 +101,11 @@ async def test_predict_rejects_wrong_types(running_client):
     client = await running_client(app)
 
     numeric_as_string = valid_features()
-    numeric_as_string["time_in_hospital"] = "6"
+    numeric_as_string["house_size"] = "1800"
     assert (await client.post("/predict", json={"features": numeric_as_string})).status_code == 422
 
     code_as_number = valid_features()
-    code_as_number["admission_type_id"] = 1
+    code_as_number["zip_code"] = 78701
     assert (await client.post("/predict", json={"features": code_as_number})).status_code == 422
 
 
@@ -112,9 +113,10 @@ async def test_predict_accepts_nulls_and_integer_numbers(running_client):
     app, _, _, _ = make_app()
     client = await running_client(app)
     features = valid_features()
-    features["race"] = None
-    features["number_outpatient"] = None
-    features["num_medications"] = 3.5
+    features["city"] = None
+    features["acre_lot"] = None
+    features["house_size"] = 1800.5  # float
+    features["bed"] = 4  # integer accepted for a numeric field
 
     assert (await client.post("/predict", json={"features": features})).status_code == 200
 
@@ -170,13 +172,14 @@ async def test_predict_still_answers_when_log_write_fails(running_client):
     response = await client.post("/predict", json={"features": valid_features()})
 
     assert response.status_code == 200
-    assert response.json()["prediction"] == "NO"
+    assert response.json()["prediction"] == 350_000.0
 
 
-def test_feature_schema_exposes_all_44_contract_keys():
+def test_feature_schema_exposes_all_contract_inputs():
     from api_inference.schemas import PredictFeatures
 
     properties = PredictFeatures.model_json_schema()["properties"]
     assert set(properties) == set(INPUT_COLUMNS)
-    assert "glyburide-metformin" in properties
+    assert "house_size" in properties
+    assert "price" not in properties and "street" not in properties
     assert PredictFeatures.model_config.get("extra") == "forbid"

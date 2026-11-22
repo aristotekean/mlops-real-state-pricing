@@ -23,18 +23,18 @@ async def test_feedback_records_label_for_logged_prediction(running_client):
     await _predict(client, request_id)
 
     response = await client.post(
-        f"/predict/{request_id}/feedback", json={"readmitted": "<30", "source": "ehr"}
+        f"/predict/{request_id}/feedback", json={"price": 500_000.0, "source": "mls"}
     )
 
     assert response.status_code == 200, response.text
     assert response.json() == {
         "request_id": request_id,
-        "readmitted": "<30",
-        "prediction": "NO",
+        "price": 500_000.0,
+        "prediction": 350_000.0,
         "created": True,
     }
     stored = repository.feedback[uuid.UUID(request_id)]
-    assert (stored.readmitted, stored.source) == ("<30", "ehr")
+    assert (stored.price, stored.source) == (500_000.0, "mls")
 
 
 async def test_feedback_second_call_replaces_label(running_client):
@@ -42,14 +42,14 @@ async def test_feedback_second_call_replaces_label(running_client):
     client = await running_client(app)
     request_id = str(uuid.uuid4())
     await _predict(client, request_id)
-    await client.post(f"/predict/{request_id}/feedback", json={"readmitted": "<30"})
+    await client.post(f"/predict/{request_id}/feedback", json={"price": 400_000.0})
 
-    response = await client.post(f"/predict/{request_id}/feedback", json={"readmitted": ">30"})
+    response = await client.post(f"/predict/{request_id}/feedback", json={"price": 450_000.0})
 
     assert response.status_code == 200, response.text
     assert response.json()["created"] is False
-    assert response.json()["readmitted"] == ">30"
-    assert repository.feedback[uuid.UUID(request_id)].readmitted == ">30"
+    assert response.json()["price"] == 450_000.0
+    assert repository.feedback[uuid.UUID(request_id)].price == 450_000.0
     assert repository.feedback[uuid.UUID(request_id)].source is None
 
 
@@ -59,12 +59,12 @@ async def test_feedback_for_failed_request_has_null_prediction(running_client):
     client = await running_client(app)
     request_id = str(uuid.uuid4())
     response = await client.post(
-        "/predict", json={"request_id": request_id, "features": {"race": "Caucasian"}}
+        "/predict", json={"request_id": request_id, "features": {"bed": 3}}
     )
     assert response.status_code == 422
     assert repository.rows[0].status == "failed"
 
-    response = await client.post(f"/predict/{request_id}/feedback", json={"readmitted": "NO"})
+    response = await client.post(f"/predict/{request_id}/feedback", json={"price": 300_000.0})
 
     assert response.status_code == 200, response.text
     assert response.json()["prediction"] is None
@@ -75,7 +75,7 @@ async def test_feedback_unknown_request_is_404(running_client):
     client = await running_client(app)
     request_id = str(uuid.uuid4())
 
-    response = await client.post(f"/predict/{request_id}/feedback", json={"readmitted": "NO"})
+    response = await client.post(f"/predict/{request_id}/feedback", json={"price": 300_000.0})
 
     assert response.status_code == 404, response.text
     body = response.json()
@@ -88,11 +88,13 @@ async def test_feedback_unknown_request_is_404(running_client):
 @pytest.mark.parametrize(
     "body",
     [
-        {"readmitted": "yes"},
-        {"readmitted": None},
+        {"price": 0},
+        {"price": -1},
+        {"price": "x"},
+        {"price": None},
         {},
-        {"readmitted": "NO", "extra": 1},
-        {"readmitted": "NO", "source": "x" * 201},
+        {"price": 350_000.0, "extra": 1},
+        {"price": 350_000.0, "source": "x" * 201},
     ],
 )
 async def test_feedback_rejects_invalid_body(running_client, body):
@@ -112,7 +114,7 @@ async def test_feedback_not_a_uuid_is_422(running_client):
     app, _, _, _ = make_app()
     client = await running_client(app)
 
-    response = await client.post("/predict/not-a-uuid/feedback", json={"readmitted": "NO"})
+    response = await client.post("/predict/not-a-uuid/feedback", json={"price": 300_000.0})
 
     assert response.status_code == 422
 
@@ -123,7 +125,7 @@ async def test_feedback_returns_503_when_database_write_fails(running_client):
     request_id = str(uuid.uuid4())
     await _predict(client, request_id)
 
-    response = await client.post(f"/predict/{request_id}/feedback", json={"readmitted": "NO"})
+    response = await client.post(f"/predict/{request_id}/feedback", json={"price": 300_000.0})
 
     assert response.status_code == 503, response.text
     assert response.json()["detail"]["error_code"] == "database_unavailable"

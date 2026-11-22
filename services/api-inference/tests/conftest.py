@@ -1,4 +1,4 @@
-"""Shared fakes: an in-memory model registry, a fake sklearn model, and an
+"""Shared fakes: an in-memory model registry, a fake sklearn regressor, and an
 in-memory inference log repository. No MLflow server, no Postgres."""
 
 from __future__ import annotations
@@ -18,26 +18,17 @@ from api_inference.model import ModelLoadError, ModelService, RegisteredVersion
 from api_inference.repository import FeedbackRecord, InferenceLogRecord, LoggedRequest
 from api_inference.settings import Settings
 
-# sklearn sorts classes lexicographically, so this is the realistic order.
-FAKE_CLASSES = np.array(["<30", ">30", "NO"], dtype=object)
-
 
 class FakeModel:
-    """Minimal stand-in for the served sklearn pipeline."""
+    """Minimal stand-in for the served sklearn regression pipeline."""
 
-    classes_ = FAKE_CLASSES
-
-    def __init__(self, label: str = "NO", proba: tuple[float, ...] = (0.05, 0.15, 0.8)):
-        self.label = label
-        self.proba = proba
+    def __init__(self, price: float = 350_000.0):
+        self.price = price
         self.frames: list[Any] = []
 
     def predict(self, frame):
         self.frames.append(frame)
-        return np.array([self.label] * len(frame), dtype=object)
-
-    def predict_proba(self, frame):
-        return np.array([list(self.proba)] * len(frame), dtype="float64")
+        return np.array([self.price] * len(frame), dtype="float64")
 
 
 class FakeRegistry:
@@ -67,9 +58,11 @@ class FakeRegistry:
 class InMemoryRepository:
     rows: list[InferenceLogRecord] = field(default_factory=list)
     feedback: dict[UUID, FeedbackRecord] = field(default_factory=dict)
+    history: list[dict[str, Any]] = field(default_factory=list)
     fail_ping: bool = False
     fail_log: bool = False
     fail_feedback: bool = False
+    fail_history: bool = False
     opened: bool = False
 
     async def open(self) -> None:
@@ -101,6 +94,11 @@ class InMemoryRepository:
         created = record.request_id not in self.feedback
         self.feedback[record.request_id] = record
         return created
+
+    async def list_history(self, limit: int = 100) -> list[dict[str, Any]]:
+        if self.fail_history:
+            raise RuntimeError("history query failed")
+        return self.history[:limit]
 
 
 def make_settings(**overrides: Any) -> Settings:
@@ -145,34 +143,26 @@ def make_app(
 
 
 def valid_features() -> dict[str, Any]:
-    features: dict[str, Any] = {column: "No" for column in INPUT_COLUMNS}
-    features.update(
-        {
-            "race": "Caucasian",
-            "gender": "Male",
-            "age": "[70-80)",
-            "admission_type_id": "1",
-            "discharge_disposition_id": "1",
-            "admission_source_id": "7",
-            "payer_code": None,
-            "medical_specialty": None,
-            "diag_1": "530",
-            "diag_2": "530",
-            "diag_3": "787",
-            "max_glu_serum": "None",
-            "A1Cresult": "None",
-            "change": "No",
-            "diabetesMed": "No",
-        }
-    )
-    for column in NUMERIC_INPUTS:
-        features[column] = 0
-    features["time_in_hospital"] = 6
-    features["num_lab_procedures"] = 13
-    features["num_procedures"] = 3
-    features["num_medications"] = 3
-    features["number_diagnoses"] = 9
+    """A request that satisfies the real estate input contract (strict types)."""
+    features: dict[str, Any] = {
+        "brokered_by": "101",
+        "status": "for_sale",
+        "bed": 3,
+        "bath": 2,
+        "acre_lot": 0.25,
+        "city": "Austin",
+        "state": "Texas",
+        "zip_code": "78701",
+        "house_size": 1800.0,
+        "prev_sold_date": "2020-05-01",
+    }
+    # Keep it in sync with the contract: every input column, nothing else.
+    assert set(features) == set(INPUT_COLUMNS), set(features) ^ set(INPUT_COLUMNS)
     return features
+
+
+# A couple of handy references for the tests.
+A_NUMERIC_INPUT = NUMERIC_INPUTS[0]  # e.g. "bed"
 
 
 @pytest.fixture

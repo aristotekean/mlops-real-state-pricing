@@ -64,6 +64,12 @@ class ApiClient:
     def model_info(self) -> dict[str, Any]:
         return self._get("/model-info")
 
+    def history(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Per-batch training/promotion log (RF9), served by the API."""
+        payload = self._get(f"/history?limit={limit}")
+        entries = payload.get("entries") if isinstance(payload, dict) else None
+        return entries if isinstance(entries, list) else []
+
     def predict(self, features: dict[str, Any]) -> dict[str, Any]:
         return self.predict_raw({"features": features})
 

@@ -1,4 +1,5 @@
-"""Persistence of one ``inference.logs`` row per request."""
+"""Persistence of ``inference.logs`` / ``inference.feedback`` rows, and the
+read-only ``audit.batch_history`` log the UI shows (RF9)."""
 
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ from datetime import datetime
 from typing import Any, Protocol
 from uuid import UUID
 
+from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
@@ -25,8 +27,8 @@ class InferenceLogRecord:
     # Request time captured by the API; a row replayed from the spool after an
     # outage must keep it instead of taking the column default (insert time).
     requested_at: datetime | None = None
-    prediction: str | None = None
-    probabilities: dict[str, float] | None = None
+    # The estimated price (regression target); stored as a JSON number.
+    prediction: float | None = None
     model_name: str | None = None
     model_version: str | None = None
     model_alias: str | None = None
@@ -41,7 +43,7 @@ class LoggedRequest:
 
     request_id: UUID
     status: str
-    prediction: str | None
+    prediction: float | None
 
 
 @dataclass(frozen=True)
@@ -49,7 +51,7 @@ class FeedbackRecord:
     """Mirror of the ``inference.feedback`` columns written by the API."""
 
     request_id: UUID
-    readmitted: str  # one of real_estate_model.contract.TARGET_CLASSES
+    price: float  # observed sale/listing price (the training target)
     source: str | None = None
 
 
@@ -68,22 +70,27 @@ class InferenceLogRepository(Protocol):
         """Insert or replace the label; ``True`` when the row was created."""
         ...
 
+    async def list_history(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Most recent ``audit.batch_history_summary`` rows (RF9)."""
+        ...
+
 
 _INSERT = """
 INSERT INTO inference.logs (
-    request_id, requested_at, input_data, prediction, probabilities,
+    request_id, requested_at, input_data, prediction,
     model_name, model_version, model_alias, processing_time_ms,
     status, error_code, error_message
 ) VALUES (
     %(request_id)s, COALESCE(%(requested_at)s, CURRENT_TIMESTAMP),
-    %(input_data)s, %(prediction)s, %(probabilities)s,
+    %(input_data)s, %(prediction)s,
     %(model_name)s, %(model_version)s, %(model_alias)s, %(processing_time_ms)s,
     %(status)s, %(error_code)s, %(error_message)s
 )
 """
 
+# ``prediction`` is a JSONB number: extract it as text and cast to double.
 _SELECT_LOG = """
-SELECT request_id, status, prediction #>> '{}'
+SELECT request_id, status, (prediction #>> '{}')::DOUBLE PRECISION
 FROM inference.logs
 WHERE request_id = %(request_id)s
 """
@@ -91,13 +98,20 @@ WHERE request_id = %(request_id)s
 # ``xmax = 0`` is true only for a freshly inserted row, so one round trip
 # tells whether the label was created or replaced.
 _UPSERT_FEEDBACK = """
-INSERT INTO inference.feedback (request_id, readmitted, source, recorded_at)
-VALUES (%(request_id)s, %(readmitted)s, %(source)s, CURRENT_TIMESTAMP)
+INSERT INTO inference.feedback (request_id, price, source, recorded_at)
+VALUES (%(request_id)s, %(price)s, %(source)s, CURRENT_TIMESTAMP)
 ON CONFLICT (request_id) DO UPDATE SET
-    readmitted = EXCLUDED.readmitted,
+    price = EXCLUDED.price,
     source = EXCLUDED.source,
     recorded_at = EXCLUDED.recorded_at
 RETURNING (xmax = 0) AS created
+"""
+
+_SELECT_HISTORY = """
+SELECT *
+FROM audit.batch_history_summary
+ORDER BY received_at DESC
+LIMIT %(limit)s
 """
 
 
@@ -152,11 +166,8 @@ class PostgresInferenceLogRepository:
             "request_id": record.request_id,
             "requested_at": record.requested_at,
             "input_data": Jsonb(record.input_data),
-            # ``prediction`` is a JSONB column: store the label as a JSON string.
+            # ``prediction`` is a JSONB column: store the price as a JSON number.
             "prediction": Jsonb(record.prediction) if record.prediction is not None else None,
-            "probabilities": Jsonb(record.probabilities)
-            if record.probabilities is not None
-            else None,
             "model_name": record.model_name,
             "model_version": record.model_version,
             "model_alias": record.model_alias,
@@ -179,10 +190,16 @@ class PostgresInferenceLogRepository:
     async def upsert_feedback(self, record: FeedbackRecord) -> bool:
         params = {
             "request_id": record.request_id,
-            "readmitted": record.readmitted,
+            "price": record.price,
             "source": record.source,
         }
         async with self._require_pool().connection() as conn:
             cursor = await conn.execute(_UPSERT_FEEDBACK, params)
             row = await cursor.fetchone()
         return bool(row and row[0])
+
+    async def list_history(self, limit: int = 100) -> list[dict[str, Any]]:
+        async with self._require_pool().connection() as conn:
+            cursor = conn.cursor(row_factory=dict_row)
+            await cursor.execute(_SELECT_HISTORY, {"limit": limit})
+            return await cursor.fetchall()

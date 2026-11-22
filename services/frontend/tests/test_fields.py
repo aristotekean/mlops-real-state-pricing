@@ -2,15 +2,19 @@ from frontend.examples import EXAMPLES
 from frontend.fields import FIELDS, UNKNOWN, FIELDS_BY_NAME, from_widget_value, to_widget_value
 from frontend.validation import validate_features
 
-# docs/data-contract.md: 47 source columns minus identifiers, target and the
-# three excluded columns.
-EXCLUDED = {"encounter_id", "patient_nbr", "readmitted", "weight", "examide", "citoglipton"}
+# The model input contract (docs/data-contract.md): the source columns minus the
+# target (`price`) and the identifier-like `street`.
+CONTRACT_INPUTS = {
+    "brokered_by", "status", "bed", "bath", "acre_lot",
+    "city", "state", "zip_code", "house_size", "prev_sold_date",
+}
+EXCLUDED = {"price", "street"}
 
 
-def test_form_covers_the_44_contract_inputs():
+def test_form_covers_the_contract_inputs():
     names = [field.name for field in FIELDS]
-    assert len(names) == 44
-    assert len(set(names)) == 44
+    assert len(names) == len(CONTRACT_INPUTS)
+    assert set(names) == CONTRACT_INPUTS
     assert not EXCLUDED & set(names)
 
 
@@ -30,20 +34,22 @@ def test_examples_match_the_form_and_pass_validation():
 
 
 def test_widget_round_trip_maps_missing_to_null():
-    race = FIELDS_BY_NAME["race"]
-    diag = FIELDS_BY_NAME["diag_3"]
-    days = FIELDS_BY_NAME["time_in_hospital"]
-    assert to_widget_value(race, None) == UNKNOWN
-    assert from_widget_value(race, UNKNOWN) is None
-    assert from_widget_value(diag, "   ") is None
-    assert from_widget_value(diag, " V45 ") == "V45"
-    assert from_widget_value(days, 3.0) == 3
+    state = FIELDS_BY_NAME["state"]
+    broker = FIELDS_BY_NAME["brokered_by"]
+    bed = FIELDS_BY_NAME["bed"]
+    acres = FIELDS_BY_NAME["acre_lot"]
+    assert to_widget_value(state, None) == UNKNOWN
+    assert from_widget_value(state, UNKNOWN) is None
+    assert from_widget_value(broker, "   ") is None
+    assert from_widget_value(broker, " 101 ") == "101"
+    assert from_widget_value(bed, 3.0) == 3
+    assert from_widget_value(acres, 0.25) == 0.25
 
 
-def test_validation_reports_bad_codes_and_ranges():
+def test_validation_reports_bad_values_and_ranges():
     features = dict(next(iter(EXAMPLES.values()))["features"])
-    features["diag_2"] = "abc"
-    features["time_in_hospital"] = 20
-    features["diag_1"] = None
+    features["zip_code"] = "abc"
+    features["bed"] = 99  # out of range
+    features["status"] = None  # required select
     fields = {name for name, _ in validate_features(features)}
-    assert fields == {"diag_1", "diag_2", "time_in_hospital"}
+    assert fields == {"zip_code", "bed", "status"}

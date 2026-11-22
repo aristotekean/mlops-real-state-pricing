@@ -1,8 +1,8 @@
 # api-inference
 
-Servicio FastAPI que expone el modelo de readmisión diabética registrado en
-MLflow (`models:/real_estate@production`), registra cada inferencia en la tabla
-`inference.logs` y publica métricas Prometheus.
+Servicio FastAPI que expone el modelo de **precios inmobiliarios** (regresión)
+registrado en MLflow (`models:/real_estate@production`), registra cada inferencia
+en la tabla `inference.logs` y publica métricas Prometheus.
 
 ## Endpoints
 
@@ -11,8 +11,9 @@ MLflow (`models:/real_estate@production`), registra cada inferencia en la tabla
 | GET    | `/health`       | Liveness. Siempre `200`; informa `model_loaded` y el estado de la base de datos (`ok`/`error`). |
 | GET    | `/model-info`   | Nombre, alias, versión, `run_id`, estado (`ready`/`unavailable`), `loaded_at`, última comprobación del alias y último error. |
 | POST   | `/model/reload` | Fuerza la recarga de la versión apuntada por el alias. Devuelve `previous_version`, `current_version` y `changed`. `503` si la carga falla (se conserva la versión anterior). |
-| POST   | `/predict`      | Una observación por petición. Contrato en `docs/data-contract.md`. |
-| POST   | `/predict/{request_id}/feedback` | Registra el resultado real (`readmitted`) de una petición ya registrada. Alimenta `inference.training_examples`. |
+| POST   | `/predict`      | Una propiedad por petición; devuelve el precio estimado. Contrato en `docs/data-contract.md`. |
+| POST   | `/predict/{request_id}/feedback` | Registra el precio real observado (`price`) de una petición ya registrada. Alimenta `inference.training_examples`. |
+| GET    | `/history`      | Historial de entrenamiento/promoción por lote (RF9), leído de `audit.batch_history_summary`. Lo consume Streamlit. |
 | GET    | `/metrics`      | Exposición Prometheus (`text/plain; version=0.0.4`). |
 
 ### `POST /predict`
@@ -20,16 +21,15 @@ MLflow (`models:/real_estate@production`), registra cada inferencia en la tabla
 ```json
 {
   "request_id": "UUID opcional; se genera si falta",
-  "features": { "race": "Caucasian", "time_in_hospital": 6, "...": "44 campos" }
+  "features": { "status": "for_sale", "bed": 3, "bath": 2, "house_size": 1800, "...": "campos del contrato" }
 }
 ```
 
-- Los 44 campos del contrato son obligatorios (admiten `null`). Los ocho
-  numéricos deben ser números JSON; el resto, cadenas (incluidos los códigos
-  como `"admission_type_id": "1"`). Los tipos son estrictos: `"6"` en un campo
-  numérico o `1` en un código se rechazan.
-- `encounter_id`, `patient_nbr`, `readmitted`, `weight`, `examide`,
-  `citoglipton` y cualquier clave desconocida producen `422`.
+- Todos los campos del contrato son obligatorios (admiten `null`). Los numéricos
+  (`bed`, `bath`, `acre_lot`, `house_size`) deben ser números JSON; el resto,
+  cadenas (incluidos los códigos como `"zip_code": "78701"`). Los tipos son
+  estrictos: `"1800"` en un campo numérico o `78701` en un código se rechazan.
+- `price` (el target), `street` y cualquier clave desconocida producen `422`.
 - El esquema se construye en tiempo de importación a partir de
   `real_estate_model.contract.INPUT_COLUMNS`/`NUMERIC_INPUTS`, de modo que la API
   y el pipeline de entrenamiento comparten la misma definición.
@@ -39,38 +39,38 @@ Respuesta `200`:
 ```json
 {
   "request_id": "UUID",
-  "prediction": "NO",
-  "probabilities": { "NO": 0.8, ">30": 0.15, "<30": 0.05 },
+  "prediction": 462750.0,
   "model": { "name": "real_estate", "version": "7", "alias": "production" },
   "processing_time_ms": 4.2
 }
 ```
 
+`prediction` es el precio estimado (número JSON, el target de la regresión).
 Errores: `422` (`validation_error`), `503` (`model_unavailable`), `500`
 (`inference_error`). El cuerpo incluye `request_id` y
 `detail.error_code`/`detail.message`.
 
 ### `POST /predict/{request_id}/feedback`
 
-Cierra el ciclo de reentrenamiento: asocia el resultado observado a una
-petición ya registrada en `inference.logs`.
+Cierra el ciclo de reentrenamiento: asocia el precio observado a una petición ya
+registrada en `inference.logs`.
 
 ```json
-{ "readmitted": "<30", "source": "ehr" }
+{ "price": 450000.0, "source": "mls" }
 ```
 
-- `readmitted` ∈ {`NO`, `>30`, `<30`}, el mismo dominio que
-  `clean.records.target_readmitted`. `source` es texto libre opcional (máx.
-  200 caracteres) con el origen de la etiqueta.
-- Semántica *upsert*: una segunda llamada para el mismo `request_id`
-  reemplaza la etiqueta (`created: false`). Así una corrección posterior gana.
+- `price` es un número positivo, el mismo dominio que `clean.records.price`.
+  `source` es texto libre opcional (máx. 200 caracteres) con el origen de la
+  etiqueta.
+- Semántica *upsert*: una segunda llamada para el mismo `request_id` reemplaza
+  la etiqueta (`created: false`). Así una corrección posterior gana.
 - Se admite feedback para peticiones fallidas (`prediction: null`), de modo que
   una observación mal puntuada también puede entrar al dataset.
 
 Respuesta `200`:
 
 ```json
-{ "request_id": "UUID", "readmitted": "<30", "prediction": "NO", "created": true }
+{ "request_id": "UUID", "price": 450000.0, "prediction": 462750.0, "created": true }
 ```
 
 Errores: `404` (`unknown_request`, no hay fila en `inference.logs`), `422`
@@ -78,10 +78,34 @@ Errores: `404` (`unknown_request`, no hay fila en `inference.logs`), `422`
 falló; a diferencia del log de inferencia, el feedback **no** se encola, el
 cliente debe reintentar).
 
+### `GET /history`
+
+Lee `audit.batch_history_summary` (esquema `audit`, misma base `postgres-train`)
+y devuelve una entrada por lote procesado por el DAG de Airflow. Es lo que
+consume la sección «Historial de entrenamiento» de Streamlit (RF9), de modo que
+la interfaz no necesita credenciales de base de datos. Acepta `?limit=` (1–500,
+100 por defecto). Si la consulta falla, responde `503`; las predicciones siguen
+sirviéndose igualmente.
+
+```json
+{
+  "entries": [
+    {
+      "api_batch_number": 4, "training_decision": "train",
+      "training_reason": "acumulación suficiente de datos recientes",
+      "promotion_decision": "promoted", "promotion_reason": "MAE −6%",
+      "production_version_before": "6", "production_version_after": "7",
+      "metric_deltas": { "validation_rmsle": -0.04 },
+      "mlflow_experiment_id": "3", "mlflow_candidate_run_id": "…",
+      "final_status": "completed"
+    }
+  ]
+}
+```
+
 ## Estrategia de carga del modelo
 
-El modelo se carga con `mlflow.sklearn.load_model` (formato `skops`) para
-disponer de `predict_proba` y `classes_`. La estrategia combina tres
+El modelo se carga con `mlflow.sklearn.load_model`. La estrategia combina tres
 mecanismos:
 
 1. **Carga en el arranque.** El `lifespan` resuelve el alias con
@@ -108,12 +132,13 @@ Las llamadas a MLflow y a scikit-learn son bloqueantes; todas se ejecutan en
 
 Se persiste una fila por petición a `/predict`, incluidas las fallidas, en la
 base de datos de entrenamiento (`postgres-train`, esquema creado por
-`infra/database/migrations/001_create_data_contract.sql`):
+`infra/database/migrations/001_raw_clean_audit.sql` y
+`002_inference_logs.sql`):
 
 - `input_data`: el objeto `features` tal como se envió (en errores de parseo
   JSON se guarda `{"raw": "<cuerpo truncado>"}`).
-- `prediction` (cadena JSON), `probabilities`, `model_name`, `model_version`,
-  `model_alias` y `processing_time_ms` en éxito.
+- `prediction` (número JSON con el precio estimado), `model_name`,
+  `model_version`, `model_alias` y `processing_time_ms` en éxito.
 - `status = failed` con `error_code` ∈ {`validation_error`,
   `model_unavailable`, `inference_error`} y `error_message` en fallo.
 
@@ -123,12 +148,12 @@ escritura en base de datos.
 ### Ground truth: `inference.feedback` y `inference.training_examples`
 
 `infra/database/migrations/003_inference_feedback.sql` añade la tabla
-`inference.feedback` (una etiqueta por `request_id`, FK a `inference.logs`) y
-la vista `inference.training_examples`, que une cada predicción exitosa con su
-etiqueta observada (`features`, `readmitted`, `predicted_readmitted`, identidad
-del modelo). Esa vista es la entrada para reentrenar con datos de producción:
-sus columnas `features`/`readmitted` espejan `clean.records`
-(`features`/`target_readmitted`).
+`inference.feedback` (una etiqueta `price` por `request_id`, FK a
+`inference.logs`) y la vista `inference.training_examples`, que une cada
+predicción exitosa con su precio observado (`features`, `price`,
+`predicted_price`, identidad del modelo). Esa vista es la entrada para
+reentrenar con datos de producción: sus columnas `features`/`price` espejan
+`clean.records` (`features`/`price`).
 
 **Decisión:** la escritura se espera dentro de la petición y la predicción se
 devuelve igual aunque falle. Lo que cambia es qué pasa con la fila:
