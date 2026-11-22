@@ -84,6 +84,12 @@ spec:
   volumeClaimTemplates:
     - metadata:
         name: data
+        # Declared here instead of left to the root kustomization: kubectl's
+        # kustomize (5.6) adds the shared label to volumeClaimTemplates and
+        # the one bundled with Argo CD (5.8) does not. The field is
+        # immutable, so both renders must produce the same template.
+        labels:
+          app.kubernetes.io/part-of: real-estate
       spec:
         accessModes:
           - ReadWriteOnce
