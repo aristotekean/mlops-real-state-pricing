@@ -137,13 +137,19 @@ def make_service(registry: FakeRegistry, settings: Settings) -> ModelService:
 def make_app(
     registry: FakeRegistry | None = None,
     repository: InMemoryRepository | None = None,
+    tracer_provider: Any | None = None,
     **settings_overrides: Any,
 ):
     settings = make_settings(**settings_overrides)
     registry = registry or FakeRegistry()
     repository = repository or InMemoryRepository()
     service = make_service(registry, settings)
-    app = create_app(settings=settings, model_service=service, repository=repository)
+    app = create_app(
+        settings=settings,
+        model_service=service,
+        repository=repository,
+        tracer_provider=tracer_provider,
+    )
     return app, registry, repository, service
 
 

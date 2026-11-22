@@ -44,6 +44,11 @@ docker compose up -d --build frontend
 # http://localhost:8501  (FRONTEND_PORT y API_URL se definen en el .env de la raíz)
 ```
 
+Con `OTEL_EXPORTER_OTLP_ENDPOINT` definida, cada llamada a la API (salvo
+`/health`) abre una traza de OpenTelemetry que la API continúa y que se
+consulta en Jaeger; vacía, el tracing queda apagado. Ver
+[`infra/monitoring`](../../infra/monitoring/README.md#trazas-jaeger).
+
 ## Pruebas
 
 ```bash

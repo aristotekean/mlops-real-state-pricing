@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -12,6 +13,8 @@ from fastapi import APIRouter, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from opentelemetry import trace
+from opentelemetry.trace import Tracer
 
 from api_inference.metrics import PREDICTION_DURATION, PREDICTIONS
 from api_inference.model import (
@@ -52,9 +55,30 @@ def _error_response(
     )
 
 
-async def _safe_log(inference_log: DurableInferenceLog, record: InferenceLogRecord) -> bool:
+async def _safe_log(
+    inference_log: DurableInferenceLog, record: InferenceLogRecord, tracer: Tracer
+) -> bool:
     """Persist (or spool) the row; a logging failure never breaks the response."""
-    return await inference_log.write(record)
+    record = replace(record, trace_id=_sampled_trace_id())
+    with tracer.start_as_current_span("inference_log.write") as span:
+        stored = await inference_log.write(record)
+        span.set_attribute("inference_log.stored", stored)
+        return stored
+
+
+def _sampled_trace_id() -> str | None:
+    """Trace id of the current request, only when its trace is being exported."""
+    context = trace.get_current_span().get_span_context()
+    if not (context.is_valid and context.trace_flags.sampled):
+        return None
+    return format(context.trace_id, "032x")
+
+
+def _annotate_request(request_id: UUID, outcome: str) -> None:
+    """Make the request findable by id and outcome on the server span."""
+    span = trace.get_current_span()
+    span.set_attribute("inference.request_id", str(request_id))
+    span.set_attribute("inference.outcome", outcome)
 
 
 def input_data_from_body(body: Any) -> dict[str, Any]:
@@ -80,6 +104,7 @@ def build_router(
     service: ModelService,
     repository: InferenceLogRepository,
     inference_log: DurableInferenceLog,
+    tracer: Tracer,
 ) -> APIRouter:
     router = APIRouter(tags=["inference"])
 
@@ -104,6 +129,7 @@ def build_router(
             """Count, log and answer one failed prediction; ``model`` is the
             version that handled it, when one did."""
             PREDICTIONS.labels(status=error_code).inc()
+            _annotate_request(request_id, error_code)
             await _safe_log(
                 inference_log,
                 InferenceLogRecord(
@@ -117,13 +143,18 @@ def build_router(
                     error_code=error_code,
                     error_message=logged_message[:_MAX_ERROR_MESSAGE],
                 ),
+                tracer,
             )
             response = _error_response(status_code, request_id, error_code, public_message)
             response.headers.update(headers or {})
             return response
 
         try:
-            result = await service.predict(payload.feature_values())
+            with tracer.start_as_current_span("model.predict") as span:
+                result = await service.predict(payload.feature_values())
+                span.set_attribute("model.name", result.model.name)
+                span.set_attribute("model.version", result.model.version)
+                span.set_attribute("model.alias", result.model.alias)
         except ModelNotLoadedError as exc:
             return await failed(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -166,6 +197,7 @@ def build_router(
 
         elapsed = time.perf_counter() - started
         PREDICTIONS.labels(status="succeeded").inc()
+        _annotate_request(request_id, "succeeded")
         PREDICTION_DURATION.observe(elapsed)
         processing_time_ms = elapsed * 1000
         record = InferenceLogRecord(
@@ -179,7 +211,7 @@ def build_router(
             model_alias=result.model.alias,
             processing_time_ms=processing_time_ms,
         )
-        await _safe_log(inference_log, record)
+        await _safe_log(inference_log, record, tracer)
         return PredictResponse(
             request_id=request_id,
             prediction=result.prediction,
@@ -228,7 +260,7 @@ def build_router(
     return router
 
 
-def build_validation_handler(inference_log: DurableInferenceLog):
+def build_validation_handler(inference_log: DurableInferenceLog, tracer: Tracer):
     """422 handler that also writes a ``failed`` row for /predict requests."""
 
     async def handler(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -237,6 +269,7 @@ def build_validation_handler(inference_log: DurableInferenceLog):
         if request.url.path == PREDICT_PATH:
             PREDICTIONS.labels(status="validation_error").inc()
             request_id = request_id_from_body(exc.body)
+            _annotate_request(request_id, "validation_error")
             message = "; ".join(
                 f"{'.'.join(str(part) for part in error.get('loc', ()))}: {error.get('msg')}"
                 for error in errors
@@ -251,6 +284,7 @@ def build_validation_handler(inference_log: DurableInferenceLog):
                     error_code="validation_error",
                     error_message=message[:_MAX_ERROR_MESSAGE],
                 ),
+                tracer,
             )
             content["request_id"] = str(request_id)
         return JSONResponse(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, content=content)

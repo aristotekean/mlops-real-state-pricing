@@ -240,7 +240,7 @@ Además se exportan los colectores por defecto (`process_*` en Linux,
 
 La API lee su configuración del entorno. En compose y en Kubernetes los valores
 salen del `.env` de la raíz del repositorio (`MLFLOW_*`, `MODEL_*`,
-`TRAIN_DB_*`; ver [`.env.example`](../../.env.example)); las demás variables de
+`TRAIN_DB_*`, `OTEL_*`; ver [`.env.example`](../../.env.example)); las demás variables de
 la tabla toman su valor por defecto.
 
 | Variable | Por defecto | Descripción |
@@ -262,6 +262,8 @@ la tabla toman su valor por defecto.
 | `INFERENCE_LOG_REPLAY_SECONDS` | `15` | Periodo del reintento en segundo plano del spool; `0` lo desactiva. |
 | `INFERENCE_LOG_CIRCUIT_SECONDS` | `30` | Tras un fallo de escritura, tiempo durante el que las filas van directo al spool; `0` intenta la base de datos en cada petición. |
 | `INFERENCE_LOG_SPOOL_MAX_BYTES` | `100663296` (96 MiB) | Tamaño máximo del spool; un replay mantiene dos copias por un momento, así que debe quedar por debajo de la mitad del volumen. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | — | URL base del receptor OTLP/HTTP de Jaeger (`http://jaeger:4318`). Vacía o ausente, el tracing queda apagado. Ver [`infra/monitoring`](../../infra/monitoring/README.md#trazas-jaeger). |
+| `OTEL_TRACES_SAMPLE_RATIO` | `1.0` | Fracción (de `0` a `1`) de solicitudes sin traza propia que se guardan; las iniciadas por el frontend siguen su decisión. |
 | `LOG_LEVEL` | `INFO` | Nivel de logging estándar. |
 
 ## Desarrollo local

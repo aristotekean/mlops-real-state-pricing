@@ -326,6 +326,14 @@ this regression model and stays null. The `request_id` is the idempotency and
 audit key and is returned to the caller. While the database is unavailable the
 rows are spooled to disk and replayed later.
 
+`trace_id` (`005_inference_logs_trace_id.sql`) links the row to its distributed
+trace in Jaeger: the W3C trace id of the request, 32 lowercase hex characters.
+It is set only when the trace was sampled, so a non-null value always points to
+a trace that was exported. It stays null when tracing is off, when the request
+was not sampled, and for rows written before the migration. Traces themselves
+are not stored in PostgreSQL; see
+[`infra/monitoring`](../infra/monitoring/README.md#trazas-jaeger).
+
 ### Feedback (ground truth)
 
 `POST /predict/{request_id}/feedback` attaches the observed price to a logged

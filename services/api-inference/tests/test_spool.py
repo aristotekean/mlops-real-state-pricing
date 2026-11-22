@@ -290,3 +290,28 @@ async def test_startup_replays_rows_spooled_by_a_previous_process(running_client
 
     assert repository.rows == [record]
     assert not spool_path.exists()
+
+
+def test_spooled_row_keeps_its_trace_id(tmp_path: Path):
+    spool = InferenceLogSpool(tmp_path / "logs.jsonl")
+    record = _record(trace_id="0af7651916cd43dd8448eb211c80319c")
+
+    spool.append(record)
+
+    assert spool.read_all() == [record]
+
+
+def test_row_without_trace_id_is_spooled_in_the_previous_format(tmp_path: Path):
+    record = _record()
+
+    assert "trace_id" not in json.loads(encode_record(record))
+
+
+def test_row_spooled_before_trace_ids_existed_is_still_replayed(tmp_path: Path):
+    spool = InferenceLogSpool(tmp_path / "logs.jsonl")
+    record = _record()
+    legacy = json.loads(encode_record(record))
+    legacy.pop("trace_id", None)
+    spool.path.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+
+    assert spool.read_all() == [record]

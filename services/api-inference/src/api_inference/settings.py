@@ -87,6 +87,9 @@ class Settings(BaseSettings):
         default=1.0, gt=0, description="Limit for the database ping /health reports."
     )
 
+    otel_exporter_otlp_endpoint: str | None = None
+    otel_traces_sample_ratio: float = Field(default=1.0, ge=0, le=1)
+
     log_level: str = "INFO"
 
     @property

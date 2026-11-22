@@ -129,7 +129,9 @@ spec:
                 name: rustfs-credentials
             # MODEL_NAME / MODEL_ALIAS (resolved as models:/<name>@<alias>),
             # MODEL_REFRESH_SECONDS (background poll of the alias, 0 disables
-            # it) and TRAIN_DB_HOST / TRAIN_DB_PORT, from .env.
+            # it), TRAIN_DB_HOST / TRAIN_DB_PORT and the tracing settings
+            # OTEL_EXPORTER_OTLP_ENDPOINT (empty turns tracing off) /
+            # OTEL_TRACES_SAMPLE_RATIO, from .env.
             - configMapRef:
                 name: api-inference-env
           env:
