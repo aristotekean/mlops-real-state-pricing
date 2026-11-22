@@ -253,6 +253,9 @@ webserver_config.py
 # Tooling
 .atl/
 
+# Reports written by the evaluar-proyecto-final-mlops skill
+/evaluacion_*.md
+
 # ODD feature documents (local working notes)
 odd/
 

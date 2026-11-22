@@ -238,6 +238,24 @@ uv run --no-project --with-requirements services/airflow/tests/requirements.txt 
 | `ml/real_estate_model/tests` | El contrato de entrada, la ingeniería de características y los candidatos |
 | `services/airflow/tests` | Las reglas de entrenamiento y de promoción, el cliente de la API de datos, el PSI y la versión de CLEAN |
 
+## Pre-evaluación con Claude Code
+
+El repositorio incluye la skill `evaluar-proyecto-final-mlops` en [.claude/skills/evaluar-proyecto-final-mlops](.claude/skills/evaluar-proyecto-final-mlops). Califica el proyecto de 0 a 5 con la rúbrica del curso y dice qué mejorar. Esta copia está adaptada para leer **este repositorio en disco**: no clona nada desde GitHub.
+
+Requiere [Claude Code](https://claude.com/claude-code), `git` y `python3` (3.8 o superior). Con Claude Code abierto en la raíz del repositorio:
+
+```text
+/evaluar-proyecto-final-mlops
+```
+
+También responde a una petición en lenguaje natural, por ejemplo "evalúa mi proyecto final de MLOps".
+
+- No ejecuta el proyecto: revisa el código, el historial de git y la evidencia del README, y abre cada imagen para comprobar que coincide con su descripción.
+- Evalúa lo que hay en disco, con los cambios sin commit incluidos, y avisa qué falta publicar: el profesor solo ve lo que está en GitHub.
+- No tiene en cuenta los archivos ignorados por git, la carpeta `.claude/` ni los reportes anteriores.
+- Guarda el reporte como `evaluacion_<repo>_<fecha>.md` en la raíz del repositorio (ignorado por git). Los datos intermedios quedan en `/tmp`.
+- Antes de la fecha límite de la rúbrica la nota es provisional, y siempre es orientativa: la calificación oficial la asigna el profesor.
+
 ## Operación
 
 | Tarea | Cómo |
