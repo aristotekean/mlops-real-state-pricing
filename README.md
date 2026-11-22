@@ -6,11 +6,18 @@ Plataforma MLOps de extremo a extremo para estimar el precio de propiedades inmo
 
 ## Ruta rápida
 
-1. Instalar en el clúster, una sola vez, el Ingress controller y metrics-server (OrbStack no trae ninguno; el HPA necesita el segundo):
+1. Instalar en el clúster, una sola vez, los CRDs de Gateway API, Traefik como controlador y metrics-server (OrbStack no trae ninguno; el HPA necesita el último). Los CRDs van primero porque el `GatewayClass` de Traefik es uno de ellos:
 
    ```bash
-   kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.15.1/deploy/static/provider/cloud/deploy.yaml
+   kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.3/standard-install.yaml
+   kubectl apply -k infra/k8s/traefik
    kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.9.1/components.yaml
+   ```
+
+   Si el clúster todavía tiene ingress-nginx, hay que quitarlo antes: los dos publican un LoadBalancer en el puerto 80.
+
+   ```bash
+   kubectl delete -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.15.1/deploy/static/provider/cloud/deploy.yaml
    ```
 
 2. Desplegar Server A completo (usa las imágenes publicadas en Docker Hub, no hace falta construir nada):
@@ -66,14 +73,14 @@ flowchart LR
         s4["S4 api-inference<br/>FastAPI + HPA"] -->|"models:/real_estate@production"| s2
         s4 -->|inference.logs| s5
         s7["S7 frontend<br/>Streamlit"] -->|/predict| s4
-        ing["Ingress nginx"] --> s4 & s7 & s2 & s6
+        ing["Gateway API · Traefik"] --> s4 & s7 & s2 & s6
     end
     b["Server B · Locust"] -->|carga| ing
     s8["Server C · S8 Prometheus"] -->|/metrics| s4
     s8 --> s9["S9 Grafana"]
 ```
 
-Los tres servidores se conectan por una red Tailscale. En OrbStack todo Server A queda en el namespace `real-estate` y el Ingress resuelve los hosts `*.k8s.orb.local` desde el Mac.
+Los tres servidores se conectan por una red Tailscale. En OrbStack todo Server A queda en el namespace `real-estate` y el Gateway (Gateway API, servido por Traefik) resuelve los hosts `*.k8s.orb.local` desde el Mac.
 
 | Servicio | URL | Credenciales | Rol |
 |----------|-----|--------------|-----|
@@ -96,7 +103,7 @@ flowchart TB
     env[".env"] -->|render-env.sh| gen["infra/k8s/settings · ConfigMaps (git)<br/>infra/k8s/generated · Secrets (fuera de git)"]
 
     subgraph ns["namespace real-estate"]
-        ing["Ingress nginx<br/>*.k8s.orb.local"]
+        ing["Gateway + HTTPRoutes · Traefik<br/>*.k8s.orb.local"]
         ing --> svcfe["svc frontend"] --> fe["Deployment frontend<br/>1 pod · Streamlit"]
         ing --> svcapi["svc api-inference"] --> api["Deployment api-inference<br/>HPA 1-20 pods · FastAPI"]
         ing --> svcml["svc mlflow"] --> ml["Deployment mlflow<br/>1 pod · tracking + registry"]
@@ -205,7 +212,7 @@ El diseño completo, las reglas de decisión y de promoción y la tabla de pará
 ├── infra/
 │   ├── argocd/                       # Application de Argo CD que sincroniza infra/k8s
 │   ├── database/migrations/          # Esquemas raw, clean e inference
-│   ├── k8s/                          # Manifiestos kustomize de Server A (S1–S7, Ingress, HPA)
+│   ├── k8s/                          # Manifiestos kustomize de Server A (S1–S7, Gateway API, HPA) y Traefik
 │   ├── load-testing/                 # Server B: Locust
 │   └── monitoring/                   # Server C: Prometheus y Grafana
 ├── notebooks/01_eda.ipynb            # Análisis exploratorio que justifica el procesamiento
@@ -266,7 +273,7 @@ Prometheus en <http://localhost:9090> y Grafana en <http://localhost:3000> (`adm
 - El pod corre una imagen distinta a la de Docker Hub: el tag ya existía en la máquina (`imagePullPolicy: IfNotPresent` y OrbStack comparte el almacén con Docker). Publica con un tag nuevo.
 - `kubectl apply` dice que `airflow-init` es inmutable: el Job aún no venció su TTL de 10 minutos. `kubectl -n real-estate delete job airflow-init` y vuelve a aplicar.
 - MLflow responde `403` o la UI carga sin runs desde otra máquina: añade el host a `MLFLOW_ALLOWED_HOSTS` y el origen a `MLFLOW_CORS_ALLOWED_ORIGINS` en `infra/k8s/base/mlflow/deployment.yaml`.
-- Los hosts `*.k8s.orb.local` solo existen en OrbStack. En un servidor Linux sustitúyelos en `infra/k8s/base/ingress/ingress.yaml` por el nombre Tailscale del nodo y expón el controller con el LoadBalancer o NodePort del clúster.
+- Los hosts `*.k8s.orb.local` solo existen en OrbStack. En un servidor Linux sustitúyelos en `infra/k8s/base/gateway/httproutes.yaml` por el nombre Tailscale del nodo y expón el controller con el LoadBalancer o NodePort del clúster.
 
 ## Evidencias
 

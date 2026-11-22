@@ -37,7 +37,7 @@ configMapGenerator:
       # the api-server container in the SAME pod, so localhost is used instead
       # of the `airflow-apiserver` Service: it does not depend on that
       # Service's readiness gate and never leaves the pod. The Service stays
-      # for the Ingress and the UI. The path must keep its trailing slash.
+      # for the Gateway and the UI. The path must keep its trailing slash.
       - AIRFLOW__CORE__EXECUTION_API_SERVER_URL=http://localhost:8080/execution/
       # Lets /api/v2/monitor/health report the scheduler heartbeat.
       - AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK=true

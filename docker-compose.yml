@@ -195,7 +195,7 @@ services:
   #
   # Built from services/api-inference/Dockerfile with the repository root as
   # context. Single replica with a published host port for local development;
-  # in the cluster the Ingress controller fronts it instead.
+  # in the cluster the Gateway (Traefik) fronts it instead.
   # ------------------------------------------------------------------------- #
   api-inference:
     image: ${DOCKERHUB_USER:?}/real-estate-api-inference:${IMAGE_TAG:?}

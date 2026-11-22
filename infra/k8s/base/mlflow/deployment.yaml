@@ -119,7 +119,7 @@ spec:
               # Linux server or VM).
               # CSRF guard (--cors-allowed-origins): POSTs whose Origin header
               # is neither localhost nor listed get 403. Browsers send Origin
-              # on same-origin POSTs too, so the UI served through the ingress
+              # on same-origin POSTs too, so the UI served through the Gateway
               # blocks its own runs/search without this. Allowed: the OrbStack
               # domain and anything appended through
               # MLFLOW_CORS_ALLOWED_ORIGINS (comma-separated, full origins with
