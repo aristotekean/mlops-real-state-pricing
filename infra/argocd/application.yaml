@@ -1,0 +1,29 @@
+# Argo CD Application: keeps the cluster in sync with infra/k8s on main.
+#
+# Apply once, after installing Argo CD in the cluster and creating the Secrets:
+#   kubectl create namespace real-estate
+#   bash infra/k8s/scripts/render-env.sh
+#   kubectl apply -k infra/k8s/generated
+#   kubectl apply -f infra/argocd/application.yaml
+#
+# The Secrets are rendered from .env into infra/k8s/generated, which is not in
+# git, so Argo CD neither creates nor prunes them.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: real-estate
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/aristotekean/mlops-real-state-pricing.git
+    targetRevision: main
+    path: infra/k8s
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: real-estate
+  syncPolicy:
+    automated:
+      # Remove resources deleted from git and revert manual cluster changes.
+      prune: true
+      selfHeal: true

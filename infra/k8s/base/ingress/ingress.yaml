@@ -2,7 +2,7 @@
 #
 # One Ingress object holds all hosts: they share the same controller, the same
 # annotations and ship as one unit, so a reviewer sees the whole routing table
-# in one place and `kubectl -n real_estate get ingress` shows a single row.
+# in one place and `kubectl -n real-estate get ingress` shows a single row.
 #
 # Hosts use OrbStack's wildcard domain: every `*.k8s.orb.local` name resolves
 # on the Mac to the cluster's LoadBalancer, so no /etc/hosts entries are

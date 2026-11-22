@@ -1,0 +1,141 @@
+name: CI Unit Tests + DockerHub Publish
+
+on:
+  push:
+    branches:
+      - main
+      - "feature/**"
+    paths:
+      - "services/**"
+      - "ml/**"
+      - "scripts/**"
+      - ".dockerignore"
+      - ".github/workflows/ci-cd-unit-tests-dockerhub.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "services/**"
+      - "ml/**"
+      - "scripts/**"
+      - ".dockerignore"
+      - ".github/workflows/ci-cd-unit-tests-dockerhub.yml"
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # uv installs the interpreter each project pins in .python-version.
+          - suite: api-inference
+            workdir: services/api-inference
+            command: uv sync --locked --group dev && uv run --locked pytest -q
+          - suite: frontend
+            workdir: services/frontend
+            command: uv sync --locked --group dev && uv run --locked pytest -q
+          # The shared package has no lockfile: install it with pytest into a
+          # throwaway environment.
+          - suite: real-estate-model
+            workdir: ml/real_estate_model
+            command: uv run --no-project --python 3.14 --with . --with pytest pytest -q tests
+    name: unit-tests (${{ matrix.suite }})
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Run unit tests
+        working-directory: ${{ matrix.workdir }}
+        run: ${{ matrix.command }}
+
+  publish-dockerhub:
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        # Same components and image names as scripts/publish_images.sh.
+        component: [api-inference, frontend, airflow]
+    env:
+      IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/real-estate-${{ matrix.component }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Emulation for the non-native platform of the multi-arch build below.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          # Every Dockerfile builds from the repository root.
+          context: .
+          file: services/${{ matrix.component }}/Dockerfile
+          push: true
+          # amd64 for cloud clusters, arm64 for Apple Silicon / ARM nodes.
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+
+  # GitOps hand-off: pin the images just published in infra/k8s so Argo CD,
+  # which watches that path, rolls them out. The commit only touches infra/**,
+  # which is outside this workflow's path filters, and pushes made with
+  # GITHUB_TOKEN do not trigger workflows, so it cannot loop.
+  update-manifests:
+    needs: publish-dockerhub
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: update-manifests
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Pin image tags in kustomization
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          sed -i -E \
+            -e "s|^([[:space:]]*newName:).*/(real-estate-[a-z-]+)$|\1 docker.io/${DOCKERHUB_USERNAME}/\2|" \
+            -e "s|^([[:space:]]*newTag:).*|\1 ${GITHUB_SHA}|" \
+            infra/k8s/kustomization.yaml
+          # The three project images are published together, at the same SHA.
+          test "$(grep -c "newTag: ${GITHUB_SHA}$" infra/k8s/kustomization.yaml)" -eq 3
+          kubectl kustomize infra/k8s > /dev/null
+
+      - name: Commit and push
+        run: |
+          if git diff --quiet -- infra/k8s/kustomization.yaml; then
+            echo "Manifests already pinned to ${GITHUB_SHA}; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(infra): deploy real-estate images ${GITHUB_SHA::7}" \
+            -- infra/k8s/kustomization.yaml
+          git push origin HEAD:main

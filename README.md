@@ -16,7 +16,10 @@ Plataforma MLOps de extremo a extremo para estimar el precio de propiedades inmo
 2. Desplegar Server A completo (usa las imágenes publicadas en Docker Hub, no hace falta construir nada):
 
    ```bash
-   kubectl apply -k infra/k8s
+   kubectl create namespace real-estate
+   bash infra/k8s/scripts/render-env.sh   # .env -> ConfigMaps (infra/k8s/settings) y Secrets (infra/k8s/generated)
+   kubectl apply -k infra/k8s/generated   # los Secrets no están en git
+   kubectl apply -k infra/k8s             # o registrar la Application de Argo CD, ver más abajo
    kubectl -n real-estate get pods        # esperar Running / Completed; el primer arranque tarda unos minutos
    ```
 
@@ -86,11 +89,11 @@ Los tres servidores se conectan por una red Tailscale. En OrbStack todo Server A
 
 ## Infraestructura en Kubernetes
 
-Todo Server A se despliega con `kubectl apply -k infra/k8s` en el namespace `real-estate`. Cada componente tiene su carpeta en `infra/k8s/base/<componente>` con el workload, su Service y, cuando aplica, PVC y Jobs; los ConfigMaps y Secrets se generan desde `.env` con `infra/k8s/scripts/render-env.sh`, que también fija la imagen `DOCKERHUB_USER/<imagen>:IMAGE_TAG` de los tres componentes propios.
+Todo Server A se despliega con `kubectl apply -k infra/k8s` en el namespace `real-estate`. Cada componente tiene su carpeta en `infra/k8s/base/<componente>` con el workload, su Service y, cuando aplica, PVC y Jobs; los ConfigMaps y Secrets se generan desde `.env` con `infra/k8s/scripts/render-env.sh`: los ConfigMaps quedan en `infra/k8s/settings` (versionado) y los Secrets en `infra/k8s/generated` (ignorado por git, se aplica aparte con `kubectl apply -k infra/k8s/generated`). La imagen de los tres componentes propios se fija en `infra/k8s/kustomization.yaml`.
 
 ```mermaid
 flowchart TB
-    env[".env"] -->|render-env.sh| gen["infra/k8s/generated<br/>ConfigMaps · Secrets · images"]
+    env[".env"] -->|render-env.sh| gen["infra/k8s/settings · ConfigMaps (git)<br/>infra/k8s/generated · Secrets (fuera de git)"]
 
     subgraph ns["namespace real-estate"]
         ing["Ingress nginx<br/>*.k8s.orb.local"]
@@ -131,6 +134,39 @@ Las bases de datos y RustFS son `StatefulSet` con una réplica: el pod tiene ide
 
 Los init containers de espera (`pg_isready`, `mc`) y los Jobs también declaran `requests` y `limits`; `bash infra/k8s/scripts/check.sh` renderiza `.env` y valida que el kustomize construya antes de commitear.
 
+### CI/CD con GitHub Actions y Argo CD
+
+El workflow `.github/workflows/ci-cd-unit-tests-dockerhub.yml` se dispara con cambios en `services/`, `ml/` y `scripts/` (pushes a `main` y `feature/**`, y pull requests hacia `main`):
+
+1. `unit-tests` corre las tres suites (`api-inference`, `frontend`, `real-estate-model`).
+2. `publish-dockerhub`, solo en pushes a `main` y si las pruebas pasan, construye y publica las tres imágenes `real-estate-*` para `linux/amd64` y `linux/arm64` con las etiquetas `latest` y el SHA del commit.
+3. `update-manifests` escribe ese SHA en los tres `newTag` de `infra/k8s/kustomization.yaml` y hace commit en `main`.
+4. Argo CD detecta el commit y despliega las imágenes nuevas.
+
+Ese commit solo toca `infra/**`, que está fuera de los `paths` del workflow, y se publica con `GITHUB_TOKEN`, por lo que no vuelve a disparar el workflow. Para habilitar la publicación, configura los secretos del repositorio `DOCKERHUB_USERNAME` y `DOCKERHUB_TOKEN`.
+
+`infra/argocd/application.yaml` declara una `Application` que mantiene el clúster sincronizado con `infra/k8s` en `main` (sincronización automática, con `prune` y `selfHeal`). Puesta en marcha, una sola vez:
+
+```bash
+# 1. Instalar Argo CD (consulta la guía oficial para tu versión)
+kubectl create namespace argocd
+kubectl apply -n argocd --server-side \
+  -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# 2. Crear los Secrets (Argo CD no los gestiona: no están en git)
+kubectl create namespace real-estate
+bash infra/k8s/scripts/render-env.sh
+kubectl apply -k infra/k8s/generated
+
+# 3. Registrar la aplicación
+kubectl apply -f infra/argocd/application.yaml
+```
+
+- Los Jobs (`train-db-migrate`, `rustfs-init`, `airflow-init`) son hooks `Sync`: Argo CD los borra y recrea en cada sincronización, así que se vuelven a ejecutar (son idempotentes).
+- Los Secrets tienen nombre fijo. Tras cambiar una credencial en `.env`: renderizar, `kubectl apply -k infra/k8s/generated` y `kubectl -n real-estate rollout restart deployment,statefulset`.
+- Un cambio de configuración no sensible en `.env` llega al clúster por git: renderizar y commitear `infra/k8s/settings`.
+- Si el repositorio es privado, registra sus credenciales en Argo CD; y el job `update-manifests` necesita poder hacer push a `main` (una regla de protección de rama que lo impida hará fallar el paso).
+
 ## Datos en PostgreSQL
 
 `infra/database/migrations` crea los esquemas en `postgres-train`, una base distinta de la de metadatos de MLflow (`mlflow-db`). En Kubernetes los aplica el Job `train-db-migrate` (ConfigMap generado con `infra/k8s/scripts/render-migrations.sh`); en compose, el servicio del mismo nombre.
@@ -159,6 +195,7 @@ El diseño completo, las reglas de decisión y de promoción y la tabla de pará
 
 ```text
 .
+├── .github/workflows/                # CI: pruebas, publicación en Docker Hub y pin de imágenes en infra/k8s
 ├── docker-compose.yml                # Stack completo en compose (incluye airflow, locust y monitoring)
 ├── services/
 │   ├── api-inference/                # S4 FastAPI: /predict, /health, /model-info, /model/reload, /metrics
@@ -166,6 +203,7 @@ El diseño completo, las reglas de decisión y de promoción y la tabla de pará
 │   └── airflow/                      # S6 imagen y DAG real_estate_incremental_training
 ├── ml/real_estate_model/                # Paquete compartido: contrato, features, splits, modelos
 ├── infra/
+│   ├── argocd/                       # Application de Argo CD que sincroniza infra/k8s
 │   ├── database/migrations/          # Esquemas raw, clean e inference
 │   ├── k8s/                          # Manifiestos kustomize de Server A (S1–S7, Ingress, HPA)
 │   ├── load-testing/                 # Server B: Locust
@@ -198,8 +236,8 @@ uv run --no-project --with-requirements services/airflow/tests/requirements.txt 
 | Tarea | Cómo |
 |-------|------|
 | Levantar todo con compose en vez de Kubernetes | Copiar `.env.example` a `.env` y `docker compose up -d` (en Linux ajustar `AIRFLOW_UID` con `id -u`). MLflow en `localhost:5001`, API en `8000`, frontend en `8501`, Airflow en `8080` |
-| Publicar una versión nueva | `IMAGE_TAG=0.1.2 scripts/publish_images.sh` construye `amd64` y `arm64` y publica. Siempre un tag nuevo: el nodo reutiliza un tag ya descargado aunque el contenido cambie |
-| Redesplegar | Cambiar los tres `newTag` en `infra/k8s/kustomization.yaml`, `kubectl apply -k infra/k8s` y `kubectl -n real-estate rollout status deploy/api-inference deploy/frontend deploy/airflow`. Los PVC conservan modelo, bases y dataset |
+| Publicar una versión nueva | Un push a `main` la publica con el SHA del commit (ver [CI/CD](#cicd-con-github-actions-y-argo-cd)). A mano: `IMAGE_TAG=0.1.2 scripts/publish_images.sh` construye `amd64` y `arm64` y publica. Siempre un tag nuevo: el nodo reutiliza un tag ya descargado aunque el contenido cambie |
+| Redesplegar | Con Argo CD, el workflow fija los tres `newTag` en `infra/k8s/kustomization.yaml` y Argo CD sincroniza. A mano: cambiar los tres `newTag`, `kubectl apply -k infra/k8s` y `kubectl -n real-estate rollout status deploy/api-inference deploy/frontend deploy/airflow`. Los PVC conservan modelo, bases y dataset |
 | Cambiar una migración SQL | Editar `infra/database/migrations`, correr `bash infra/k8s/scripts/render-migrations.sh` y commitear el ConfigMap. `bash infra/k8s/scripts/check.sh` valida los manifiestos antes de commitear |
 | Pausar el reentrenamiento | `kubectl -n real-estate exec deploy/airflow -c scheduler -- airflow dags pause real_estate_incremental_training` (en un portátil conviene tras la primera corrida) |
 | Prueba de carga | `LOCUST_HOST=http://api.k8s.orb.local docker compose --profile loadtest up -d` y abrir `localhost:8089`; `LOCUST_STEP_LOAD=1` busca el punto de degradación por escalones |

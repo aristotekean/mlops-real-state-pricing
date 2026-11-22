@@ -1,35 +1,47 @@
 #!/usr/bin/env bash
-# Render the stack configuration in .env (repository root) into the kustomize
-# component infra/k8s/generated, which infra/k8s/kustomization.yaml lists under
-# `components:`. The component holds:
+# Render the stack configuration in .env (repository root) into two kustomize
+# directories under infra/k8s:
 #
-#   - one env file + generator per ConfigMap / Secret the manifests reference
-#     (mlflow-client-env, rustfs-credentials, postgres-train-credentials, ...);
-#   - the `images:` block, so DOCKERHUB_USER / IMAGE_TAG pick the image tags;
-#   - a merge of the .env values into the `airflow-env` ConfigMap, whose fixed
-#     Airflow settings stay in base/airflow/kustomization.yaml.
+#   settings/   COMMITTED. Component listed under `components:` in
+#               infra/k8s/kustomization.yaml: one env file + generator per
+#               non-secret ConfigMap (mlflow-client-env, api-inference-env,
+#               ...) and a merge of the .env values into the `airflow-env`
+#               ConfigMap, whose fixed Airflow settings stay in
+#               base/airflow/kustomization.yaml. Argo CD renders it from git.
+#   generated/  GIT-IGNORED. Standalone kustomization with one env file +
+#               generator per Secret (rustfs-credentials,
+#               postgres-train-credentials, ...). Applied by hand; Argo CD
+#               never sees it.
 #
 # Why rendered: kustomize's load restrictions only let a generator read files
 # under its own root (infra/k8s), so it cannot read the root .env, and one
 # .env feeds several objects under other key names (POSTGRES_USER from
 # TRAIN_DB_USER, AWS_ACCESS_KEY_ID from RUSTFS_ACCESS_KEY, ...).
 #
-# The output contains credentials, so it is git-ignored. Re-run it after every
-# change to .env, then apply:
+# Re-run it after every change to .env, then:
 #
 #   bash infra/k8s/scripts/render-env.sh             # reads <repo>/.env
 #   bash infra/k8s/scripts/render-env.sh other.env   # another settings file
-#   kubectl apply -k infra/k8s
+#   kubectl apply -k infra/k8s/generated             # if a Secret changed
+#   git commit infra/k8s/settings                    # if a ConfigMap changed
 #
-# The generated objects carry a content hash in their name, so a changed value
-# rolls the pods that use it on the next apply.
+# The ConfigMaps carry a content hash in their name, so a changed value rolls
+# the pods that use it on the next sync. The Secrets keep a fixed name, because
+# the manifests in git must reference them without knowing their content:
+# after changing a credential, restart the workloads that read it
+# (kubectl -n real-estate rollout restart deployment,statefulset).
+#
+# The project image tags are not rendered here: they are pinned in
+# infra/k8s/kustomization.yaml by the CI workflow.
 #
 # Written for bash 3.2 (the one macOS ships) as well as Linux bash.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 ENV_FILE="${1:-$ROOT/.env}"
-OUT="$ROOT/infra/k8s/generated"
+SETTINGS="$ROOT/infra/k8s/settings"
+SECRETS="$ROOT/infra/k8s/generated"
+NAMESPACE="real-estate"
 
 if [[ ! -f "$ENV_FILE" ]]; then
     echo "missing $ENV_FILE: create it with 'cp .env.example .env' and set the values" >&2
@@ -43,8 +55,7 @@ set -a
 . "$ENV_FILE"
 set +a
 
-REQUIRED="DOCKERHUB_USER IMAGE_TAG
-MLFLOW_DB_NAME MLFLOW_DB_USER MLFLOW_DB_PASSWORD
+REQUIRED="MLFLOW_DB_NAME MLFLOW_DB_USER MLFLOW_DB_PASSWORD
 RUSTFS_ACCESS_KEY RUSTFS_SECRET_KEY MLFLOW_ARTIFACTS_BUCKET
 MLFLOW_TRACKING_URI MLFLOW_S3_ENDPOINT_URL MLFLOW_EXPERIMENT_NAME
 MODEL_NAME MODEL_ALIAS MODEL_REFRESH_SECONDS
@@ -68,10 +79,10 @@ if [[ -n "$missing" ]]; then
     exit 1
 fi
 
-# write_env FILE KEY... : one KEY=value line per variable, value taken from the
-# variable of the same name.
+# write_env FILE KEY... : one KEY=value line per variable in settings/, value
+# taken from the variable of the same name.
 write_env() {
-    local file="$OUT/$1" key
+    local file="$SETTINGS/$1" key
     shift
     : > "$file"
     for key in "$@"; do
@@ -79,16 +90,17 @@ write_env() {
     done
 }
 
-# write_pairs FILE KEY=VALUE... : lines given verbatim, for keys renamed on
-# the way (the Postgres image reads POSTGRES_*, S3 clients read AWS_*).
+# write_pairs FILE KEY=VALUE... : lines given verbatim in generated/, for keys
+# renamed on the way (the Postgres image reads POSTGRES_*, S3 clients read
+# AWS_*).
 write_pairs() {
-    local file="$OUT/$1"
+    local file="$SECRETS/$1"
     shift
     printf '%s\n' "$@" > "$file"
 }
 
-rm -rf "$OUT"
-mkdir -p "$OUT"
+rm -rf "$SETTINGS" "$SECRETS"
+mkdir -p "$SETTINGS" "$SECRETS"
 
 # ConfigMaps.
 write_env mlflow-client-env.env MLFLOW_TRACKING_URI MLFLOW_S3_ENDPOINT_URL
@@ -125,9 +137,9 @@ write_pairs airflow-admin-user.env \
     "_AIRFLOW_WWW_USER_USERNAME=$AIRFLOW_ADMIN_USER" \
     "_AIRFLOW_WWW_USER_PASSWORD=$AIRFLOW_ADMIN_PASSWORD"
 
-cat > "$OUT/kustomization.yaml" <<EOF
+cat > "$SETTINGS/kustomization.yaml" <<EOF
 # GENERATED by infra/k8s/scripts/render-env.sh from .env; do not edit, re-run
-# the script instead.
+# the script instead and commit the result.
 apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 
@@ -144,6 +156,24 @@ configMapGenerator:
   - name: airflow-env
     behavior: merge
     envs: [airflow-env.env]
+EOF
+
+cat > "$SECRETS/kustomization.yaml" <<EOF
+# GENERATED by infra/k8s/scripts/render-env.sh from .env; do not edit, re-run
+# the script instead. Holds credentials: git-ignored, applied by hand with
+# kubectl apply -k infra/k8s/generated
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: $NAMESPACE
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: $NAMESPACE
+
+# Fixed names: the manifests in git reference these Secrets as written here.
+generatorOptions:
+  disableNameSuffixHash: true
 
 secretGenerator:
   - name: rustfs-credentials
@@ -158,19 +188,6 @@ secretGenerator:
     envs: [airflow-secrets.env]
   - name: airflow-admin-user
     envs: [airflow-admin-user.env]
-
-# The manifests name the images without a tag; this rewrites each one to
-# DOCKERHUB_USER/<image>:IMAGE_TAG.
-images:
-  - name: aristotekean/real-estate-api-inference
-    newName: $DOCKERHUB_USER/real-estate-api-inference
-    newTag: "$IMAGE_TAG"
-  - name: aristotekean/real-estate-frontend
-    newName: $DOCKERHUB_USER/real-estate-frontend
-    newTag: "$IMAGE_TAG"
-  - name: aristotekean/real-estate-airflow
-    newName: $DOCKERHUB_USER/real-estate-airflow
-    newTag: "$IMAGE_TAG"
 EOF
 
-echo "rendered ${OUT#"$ROOT"/} from $ENV_FILE"
+echo "rendered ${SETTINGS#"$ROOT"/} and ${SECRETS#"$ROOT"/} from $ENV_FILE"

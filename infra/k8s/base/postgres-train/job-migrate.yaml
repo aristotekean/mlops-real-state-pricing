@@ -10,7 +10,7 @@
 # (and re-runs) the Job instead of failing with "field is immutable". To apply
 # NEW migrations on a running cluster:
 #   bash infra/k8s/scripts/render-migrations.sh
-#   kubectl -n real_estate delete job train-db-migrate   # only if it still exists
+#   kubectl -n real-estate delete job train-db-migrate   # only if it still exists
 #   kubectl apply -k infra/k8s
 apiVersion: batch/v1
 kind: Job
@@ -18,6 +18,13 @@ metadata:
   name: train-db-migrate
   labels:
     app.kubernetes.io/name: train-db-migrate
+  annotations:
+    # Argo CD runs this Job as a Sync hook: it is deleted and recreated on
+    # every sync (so the immutable pod template never blocks one) and is not
+    # tracked as live state (so the TTL cleanup below does not show the
+    # application as OutOfSync). `kubectl apply` ignores both annotations.
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
 spec:
   # Bounded on both axes: at most 4 retries of the pod, and the whole Job is
   # killed and marked Failed after 20 minutes regardless of retries. The

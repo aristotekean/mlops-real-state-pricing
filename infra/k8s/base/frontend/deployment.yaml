@@ -1,6 +1,6 @@
 # Mirror of the `frontend` service in docker-compose.yml. The image is
-# referenced by name only: infra/k8s/generated sets DOCKERHUB_USER/IMAGE_TAG
-# from .env. No init wait: the UI shows the API as unreachable until
+# referenced by name only: infra/k8s/kustomization.yaml pins the registry and
+# tag. No init wait: the UI shows the API as unreachable until
 # api-inference answers, which is the honest state during a rollout.
 apiVersion: apps/v1
 kind: Deployment
@@ -22,7 +22,7 @@ spec:
         - name: streamlit
           image: aristotekean/real-estate-frontend
           imagePullPolicy: IfNotPresent
-          # API_URL, from .env (infra/k8s/generated).
+          # API_URL, from .env (infra/k8s/settings).
           envFrom:
             - configMapRef:
                 name: frontend-env

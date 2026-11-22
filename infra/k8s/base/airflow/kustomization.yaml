@@ -22,7 +22,7 @@ resources:
 # and to the four Airflow containers. The fixed Airflow settings live here; the
 # deployment-specific values (TRAIN_DB_HOST/PORT, MLflow experiment, model
 # name and alias, REAL_ESTATE_TRAINING_SCHEDULE) are merged in
-# from .env by infra/k8s/generated. Secrets (`airflow-secrets`,
+# from .env by infra/k8s/settings. Secrets (`airflow-secrets`,
 # `airflow-admin-user`, `postgres-train-credentials`) and the MLflow/RustFS
 # client settings (`mlflow-client-env`, `rustfs-credentials`) come from .env too
 # and are attached separately.

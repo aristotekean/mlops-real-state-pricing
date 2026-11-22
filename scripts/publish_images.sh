@@ -12,8 +12,10 @@
 #
 # Settings: DOCKERHUB_USER and IMAGE_TAG come from .env (a value exported in
 # the shell overrides it for one run); PLATFORMS and BUILDER from the shell.
-# After publishing a new tag, set it as IMAGE_TAG in .env so compose and
-# Kubernetes (infra/k8s/scripts/render-env.sh) deploy it.
+# After publishing a new tag, set it as IMAGE_TAG in .env so compose deploys
+# it. Kubernetes takes its tags from infra/k8s/kustomization.yaml, which the
+# CI workflow pins after publishing on every push to main; this script is the
+# manual path.
 # The images are built from the working tree, so pushing a tree with
 # uncommitted changes is refused unless ALLOW_DIRTY=1: the published image must
 # match a commit of the repository.

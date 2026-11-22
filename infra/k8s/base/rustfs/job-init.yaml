@@ -13,6 +13,13 @@ metadata:
   name: rustfs-init
   labels:
     app.kubernetes.io/name: rustfs-init
+  annotations:
+    # Argo CD runs this Job as a Sync hook: it is deleted and recreated on
+    # every sync (so the immutable pod template never blocks one) and is not
+    # tracked as live state (so the TTL cleanup below does not show the
+    # application as OutOfSync). `kubectl apply` ignores both annotations.
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
 spec:
   # Bounded on both axes: at most 6 retries of the pod, and the whole Job is
   # killed and marked Failed after 10 minutes regardless of retries. The

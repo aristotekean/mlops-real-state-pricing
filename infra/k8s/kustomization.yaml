@@ -1,16 +1,22 @@
 # Kustomize root for Server A of the real estate MLOps stack on Kubernetes
 # (OrbStack locally; any cluster with a default StorageClass otherwise).
 #
-# Usage (configuration and image tags come from .env at the repository root):
-#   bash infra/k8s/scripts/render-env.sh  # .env -> generated/ (after every change)
-#   kubectl apply -k infra/k8s            # deploy / update everything
-#   kubectl kustomize infra/k8s           # render the manifests only
-#   kubectl -n real-estate get pods          # watch the rollout
+# Everything under this directory is in git, so Argo CD can render it
+# (infra/argocd/application.yaml). The Secrets are the exception: they are
+# rendered from .env into generated/ (git-ignored) and applied by hand, once
+# and after every credential change:
+#   kubectl create namespace real-estate    # first time only
+#   bash infra/k8s/scripts/render-env.sh    # .env -> settings/ and generated/
+#   kubectl apply -k infra/k8s/generated    # the Secrets
 #
-# Everything lands in the `real-estate` namespace. Project images are named
-# without a tag in the manifests; generated/ rewrites them to
-# DOCKERHUB_USER/<image>:IMAGE_TAG from .env. Third-party images follow docker-compose.yml: postgres and mlflow are pinned
-# in their own manifests, and so is RustFS (`rustfs/rustfs`).
+# Without Argo CD, deploy the rest by hand:
+#   kubectl apply -k infra/k8s              # deploy / update everything
+#   kubectl kustomize infra/k8s             # render the manifests only
+#   kubectl -n real-estate get pods         # watch the rollout
+#
+# Everything lands in the `real-estate` namespace. Third-party images follow
+# docker-compose.yml: postgres and mlflow are pinned in their own manifests,
+# and so is RustFS (`rustfs/rustfs`).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -20,7 +26,7 @@ namespace: real-estate
 # adding or renaming it never breaks an existing Deployment/Service pairing).
 labels:
   - pairs:
-      app.kubernetes.io/part-of: real_estate
+      app.kubernetes.io/part-of: real-estate
     includeSelectors: false
     includeTemplates: true
 
@@ -37,8 +43,22 @@ resources:
   - base/airflow
   - base/ingress
 
-# ConfigMaps, Secrets and project image tags rendered from .env by
-# scripts/render-env.sh (git-ignored: it holds the credentials). Without it the
-# build fails with "generated: no such file or directory": render it first.
+# Non-secret ConfigMaps rendered from .env by scripts/render-env.sh and
+# committed, so a configuration change reaches the cluster through git.
 components:
-  - generated
+  - settings
+
+images:
+  # Project images, named without a tag in the manifests. The update-manifests
+  # job of .github/workflows/ci-cd-unit-tests-dockerhub.yml rewrites newName
+  # and newTag below with the commit SHA after every publish; Argo CD deploys
+  # that commit. The values here are placeholders until the first run.
+  - name: aristotekean/real-estate-api-inference
+    newName: docker.io/aristotekean/real-estate-api-inference
+    newTag: latest
+  - name: aristotekean/real-estate-frontend
+    newName: docker.io/aristotekean/real-estate-frontend
+    newTag: latest
+  - name: aristotekean/real-estate-airflow
+    newName: docker.io/aristotekean/real-estate-airflow
+    newTag: latest
