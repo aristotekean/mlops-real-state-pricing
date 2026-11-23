@@ -55,10 +55,10 @@ images:
   # that commit. The values here are placeholders until the first run.
   - name: aristotekean/real-estate-api-inference
     newName: docker.io/aristotekean/real-estate-api-inference
-    newTag: 545df1bc787613ecd5353629b0b9cf0bb4d12174
+    newTag: 547c02083825666db64487b8a3b1ef3964e4e4d2
   - name: aristotekean/real-estate-frontend
     newName: docker.io/aristotekean/real-estate-frontend
-    newTag: 545df1bc787613ecd5353629b0b9cf0bb4d12174
+    newTag: 547c02083825666db64487b8a3b1ef3964e4e4d2
   - name: aristotekean/real-estate-airflow
     newName: docker.io/aristotekean/real-estate-airflow
-    newTag: 545df1bc787613ecd5353629b0b9cf0bb4d12174
+    newTag: 547c02083825666db64487b8a3b1ef3964e4e4d2
