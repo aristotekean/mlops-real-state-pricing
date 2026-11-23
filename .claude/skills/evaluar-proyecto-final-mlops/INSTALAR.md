@@ -25,7 +25,7 @@ Dentro de Claude Code, abierto en la raíz del proyecto:
 
 o en lenguaje natural: *"evalúa mi proyecto final de MLOps"*.
 
-El reporte se guarda como `evaluacion_<repo>_<fecha>.md` en la raíz del repo.
+El reporte se guarda como `evaluacion_<repo>_<fecha>.md` en la carpeta `docs/` del repo.
 
 ## Importante
 - La skill **no ejecuta** tu proyecto: evalúa lo que está en el repositorio. Si algo funciona pero no lo muestras en el README, no cuenta.

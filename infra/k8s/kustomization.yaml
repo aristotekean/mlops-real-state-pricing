@@ -1,5 +1,6 @@
 # Kustomize root for Server A of the real estate MLOps stack on Kubernetes
-# (OrbStack locally; any cluster with a default StorageClass otherwise).
+# (OrbStack locally; any cluster with a default StorageClass otherwise),
+# Prometheus, Grafana and Jaeger included.
 #
 # Everything under this directory is in git, so Argo CD can render it
 # (infra/argocd/application.yaml). The Secrets are the exception: they are
@@ -16,7 +17,7 @@
 #
 # Everything lands in the `real-estate` namespace. Third-party images follow
 # docker-compose.yml: postgres and mlflow are pinned in their own manifests,
-# and so is RustFS (`rustfs/rustfs`).
+# and so are RustFS (`rustfs/rustfs`), Prometheus, Grafana and Jaeger.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -41,6 +42,9 @@ resources:
   - base/frontend
   - base/postgres-airflow
   - base/airflow
+  - base/prometheus
+  - base/grafana
+  - base/jaeger
   - base/gateway
 
 # Non-secret ConfigMaps rendered from .env by scripts/render-env.sh and

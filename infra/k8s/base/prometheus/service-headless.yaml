@@ -1,0 +1,17 @@
+# Headless Service required by the prometheus StatefulSet (spec.serviceName):
+# it gives the pod the stable DNS name prometheus-0.prometheus-headless.
+# Clients keep using the regular `prometheus` Service in service.yaml.
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-headless
+  labels:
+    app.kubernetes.io/name: prometheus
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http

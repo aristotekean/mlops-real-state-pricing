@@ -1,19 +1,17 @@
-# Scrape target for the Inference API (file_sd for job `real-estate-api`).
+# Scrape target for the Inference API (file_sd for job `real-estate-api`) in
+# the compose deployment. On Kubernetes this file is not used: the Prometheus
+# of infra/k8s/base/prometheus discovers the API pods through the cluster API.
 #
-# Kubernetes on OrbStack (default): Server A runs in the cluster and OrbStack
-# resolves cluster Services from Docker containers, so Prometheus reaches the
-# API Service directly.
-#   - targets: ["api-inference.real-estate.svc.cluster.local:8000"]
-#
-# Local compose network (root docker-compose.yml): the Docker service name.
+# Local compose network (root docker-compose.yml, default): the Docker service
+# name.
 #   - targets: ["api-inference:8000"]
 #
-# Dedicated Server C: the host:port where Server A's API is reachable, e.g.
+# API on another machine: the host:port where it is reachable, e.g.
 #   - targets: ["server-a:8000"]
 #   - targets: ["10.0.0.5:8000"]
 #
 # Prometheus reloads this file automatically; no restart needed after editing.
 
-- targets: ["api-inference.real-estate.svc.cluster.local:8000"]
+- targets: ["api-inference:8000"]
   labels:
     service: api-inference

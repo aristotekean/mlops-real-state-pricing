@@ -2,7 +2,7 @@
 
 **Grupo 6:** Kevin Bueno · Juan Camilo Martínez · Jorge Andrés Gil
 
-Plataforma MLOps de extremo a extremo para estimar el precio de propiedades inmobiliarias. Airflow consume la API de datos del curso lote a lote (grupo 6), valida cada lote, lo guarda en RAW y CLEAN, decide con reglas explícitas si reentrena y registra el candidato en MLflow, donde solo recibe el alias `production` si supera al modelo productivo; los artefactos viven en RustFS (almacén S3), una API FastAPI sirve `models:/real_estate@production` en `POST /predict` y un frontend Streamlit lo consulta. Todo Server A corre en Kubernetes (OrbStack) con autoescalado de la API; Locust (Server B) genera carga y Prometheus + Grafana (Server C) la observan.
+Plataforma MLOps de extremo a extremo para estimar el precio de propiedades inmobiliarias. Airflow consume la API de datos del curso lote a lote (grupo 6), valida cada lote, lo guarda en RAW y CLEAN, decide con reglas explícitas si reentrena y registra el candidato en MLflow, donde solo recibe el alias `production` si supera al modelo productivo; los artefactos viven en RustFS (almacén S3), una API FastAPI sirve `models:/real_estate@production` en `POST /predict` y un frontend Streamlit lo consulta. Todo corre en Kubernetes (OrbStack) con autoescalado de la API, incluidos Prometheus, Grafana y Jaeger, que la observan; Locust (Server B) genera la carga desde otra máquina.
 
 ![Arquitectura de la plataforma](docs/images/1-arquitectura.svg)
 
@@ -75,14 +75,15 @@ flowchart LR
         s4["S4 api-inference<br/>FastAPI + HPA"] -->|"models:/real_estate@production"| s2
         s4 -->|inference.logs| s5
         s7["S7 frontend<br/>Streamlit"] -->|"/predict · /history"| s4
-        ing["Gateway API · Traefik"] --> s4 & s7 & s2 & s6
+        s8["S8 Prometheus"] -->|"/metrics de cada pod"| s4
+        s9["S9 Grafana"] -->|consultas| s8
+        s4 & s7 -->|"trazas OTLP"| s10["S10 Jaeger"]
+        ing["Gateway API · Traefik"] --> s4 & s7 & s2 & s6 & s9 & s8 & s10
     end
     b["Server B · Locust"] -->|carga| ing
-    s8["Server C · S8 Prometheus"] -->|/metrics| s4
-    s8 --> s9["S9 Grafana"]
 ```
 
-Los tres servidores se conectan por una red Tailscale. En OrbStack todo Server A queda en el namespace `real-estate` y el Gateway (Gateway API, servido por Traefik) resuelve los hosts `*.k8s.orb.local` desde el Mac.
+Server B (Locust) corre en otra máquina y llega al clúster por una red Tailscale, para que el generador de carga no compita por CPU con la API. En OrbStack todo Server A queda en el namespace `real-estate` y el Gateway (Gateway API, servido por Traefik) resuelve los hosts `*.k8s.orb.local` desde el Mac.
 
 | Servicio | URL | Credenciales | Rol |
 |----------|-----|--------------|-----|
@@ -94,8 +95,9 @@ Los tres servidores se conectan por una red Tailscale. En OrbStack todo Server A
 | `airflow` (S6) | <http://airflow.k8s.orb.local> | `airflow` / `airflow` | api-server, scheduler, dag-processor y triggerer en un pod; metadatos en `airflow-db` |
 | `data-api` | solo red interna | — | API de datos del curso (imagen del instructor); entrega los lotes al DAG |
 | `frontend` (S7) | <http://frontend.k8s.orb.local> | — | Formulario con los 10 campos del contrato e historial por lote; solo habla con la API |
-| Prometheus (S8) · Grafana (S9) | <http://localhost:9090> · <http://localhost:3000> | Grafana `admin` / `admin` | `infra/monitoring`, perfil `monitoring` de compose (independiente en Server C) |
-| Locust (Server B) | <http://localhost:8089> | — | `infra/load-testing`, perfil `loadtest` de compose |
+| Prometheus (S8) · Grafana (S9) | <http://prometheus.k8s.orb.local> · <http://grafana.k8s.orb.local> | Prometheus sin autenticación; Grafana `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` de `.env` | Métricas de cada pod de la API y dashboard **Real Estate · Inference API**, aprovisionado desde ConfigMaps |
+| Jaeger (S10) | <http://jaeger.k8s.orb.local> | sin autenticación | Trazas de cada inferencia, del frontend a la escritura del log; en memoria, se pierden al reiniciar el pod |
+| Locust (Server B) | <http://localhost:8089> | — | `infra/load-testing`, perfil `loadtest` de compose; fuera del clúster a propósito |
 
 ## Infraestructura en Kubernetes
 
@@ -220,9 +222,9 @@ El diseño completo, las reglas de decisión y de promoción y la tabla de pará
 ├── infra/
 │   ├── argocd/                       # Application de Argo CD que sincroniza infra/k8s
 │   ├── database/                     # migrate.sh y migrations/: esquemas raw, clean, audit e inference
-│   ├── k8s/                          # Manifiestos kustomize de Server A (S1–S7, Gateway API, HPA) y Traefik
+│   ├── k8s/                          # Manifiestos kustomize de Server A (S1–S10, Gateway API, HPA) y Traefik
 │   ├── load-testing/                 # Server B: Locust
-│   └── monitoring/                   # Server C: Prometheus y Grafana
+│   └── monitoring/                   # Prometheus, Grafana y Jaeger del stack de compose
 ├── scripts/publish_images.sh         # Publica las imágenes multi-arquitectura en Docker Hub
 └── docs/                             # data-contract.md, pipeline.md e images/ (diagrama y capturas de evidencia)
 ```
@@ -262,7 +264,7 @@ También responde a una petición en lenguaje natural, por ejemplo "evalúa mi p
 - No ejecuta el proyecto: revisa el código, el historial de git y la evidencia del README, y abre cada imagen para comprobar que coincide con su descripción.
 - Evalúa lo que hay en disco, con los cambios sin commit incluidos, y avisa qué falta publicar: el profesor solo ve lo que está en GitHub.
 - No tiene en cuenta los archivos ignorados por git, la carpeta `.claude/` ni los reportes anteriores.
-- Guarda el reporte como `evaluacion_<repo>_<fecha>.md` en la raíz del repositorio (ignorado por git). Los datos intermedios quedan en `/tmp`.
+- Guarda el reporte como `docs/evaluacion_<repo>_<fecha>.md`. Los datos intermedios quedan en `/tmp`.
 - Antes de la fecha límite de la rúbrica la nota es provisional, y siempre es orientativa: la calificación oficial la asigna el profesor.
 
 ## Operación
@@ -276,19 +278,20 @@ También responde a una petición en lenguaje natural, por ejemplo "evalúa mi p
 | Pausar el reentrenamiento | `kubectl -n real-estate exec deploy/airflow -c scheduler -- airflow dags pause real_estate_incremental_training` (en un portátil conviene tras la primera corrida) |
 | Prueba de carga | `LOCUST_HOST=http://api.k8s.orb.local docker compose --profile loadtest up -d` y abrir `localhost:8089`; `LOCUST_STEP_LOAD=1` busca el punto de degradación por escalones |
 | Observar el autoescalado | `kubectl -n real-estate get hpa api-inference -w` muestra CPU y réplicas en vivo; añade hasta 2 pods cada 30 s y quita 1 por minuto tras 2 minutos de calma |
-| Monitoreo | `docker compose up -d prometheus grafana` levanta solo Prometheus y Grafana (`--profile monitoring up -d` los suma al stack completo); el target de la API está en `infra/monitoring/prometheus/targets/api-targets.yml` (por defecto, el Service del clúster; cambiarlo a `api-inference:8000` para el stack de compose). RustFS no expone métricas Prometheus, así que no se monitorea. Grafana abre en el dashboard **Real Estate · Inference API** (tráfico HTTP, latencias, errores, CPU/memoria del pod y MLOps) |
+| Monitoreo | Prometheus (<http://prometheus.k8s.orb.local>) y Grafana (<http://grafana.k8s.orb.local>) corren en el clúster (`infra/k8s/base/prometheus`, `infra/k8s/base/grafana`). Prometheus descubre cada pod de la API por la API de Kubernetes, así que las réplicas que añade el HPA aparecen solas en *Status → Targets*. RustFS no expone métricas Prometheus, así que no se monitorea. Grafana abre en el dashboard **Real Estate · Inference API** (tráfico HTTP, latencias, errores, CPU/memoria por pod y MLOps), aprovisionado desde ConfigMaps: un cambio en `infra/k8s/base/grafana` llega por Argo CD y reinicia el pod |
+| Recursos de los pods | `kubectl -n real-estate top pods` muestra el consumo real (requiere metrics-server); `kubectl -n real-estate describe pod -l app.kubernetes.io/name=api-inference` muestra los `Requests` y `Limits` aplicados |
 | Actualizar un clúster desplegado con los `Deployment` anteriores de las bases | Los `StatefulSet` crean PVC nuevos (`data-<nombre>-0`), así que los datos no migran solos. Tras `kubectl apply -k infra/k8s`, borrar los workloads viejos para que el Service no reparta tráfico entre ambos: `kubectl -n real-estate delete deployment mlflow-db airflow-db postgres-train`; los PVC viejos (`mlflow-db-data`, `airflow-db-data`, `postgres-train-data`) quedan hasta borrarlos a mano. El DAG regenera datos y modelo en la primera corrida |
 | Actualizar un clúster desplegado con MinIO | `kubectl apply -k infra/k8s` crea `rustfs` con un PVC vacío (`data-rustfs-0`) pero no borra lo anterior. Borrar los objetos viejos: `kubectl -n real-estate delete statefulset/minio service/minio service/minio-headless job/minio-init --ignore-not-found`; el PVC `data-minio-0` queda hasta borrarlo a mano. Los artefactos no migran solos: el DAG regenera el modelo en la primera corrida |
 | Borrar todo | `kubectl delete -k infra/k8s` (los PVC y sus datos se van con el namespace) |
 
-Locust y el monitoreo están detrás de los perfiles `loadtest` y `monitoring` del compose raíz, así que `docker compose up -d` no los arranca. Para el monitoreo:
+Locust y el monitoreo están detrás de los perfiles `loadtest` y `monitoring` del compose raíz, así que `docker compose up -d` no los arranca. En Kubernetes el monitoreo ya corre en el clúster; para el del stack de compose:
 
 ```bash
 docker compose up -d prometheus grafana        # solo Prometheus + Grafana (nombrar el servicio activa su perfil)
 docker compose --profile monitoring up -d      # stack completo + monitoreo
 ```
 
-Prometheus en <http://localhost:9090> y Grafana en <http://localhost:3000> (`admin` / `admin`). Si se levanta desde `infra/monitoring` o `infra/load-testing` por separado (Server C o Server B), el `--profile` también es obligatorio: sin él compose no arranca ningún servicio.
+En compose, Prometheus queda en <http://localhost:9090> y Grafana en <http://localhost:3000> (`admin` / `admin`). Si se levanta desde `infra/monitoring` o `infra/load-testing` por separado (Server C o Server B), el `--profile` también es obligatorio: sin él compose no arranca ningún servicio.
 
 > Los Secrets llevan las credenciales de desarrollo de `.env` (RustFS, `airflow`, `app`, `mlflow`). Son para un clúster local; cámbialas antes de exponerlo a otras máquinas.
 
@@ -300,6 +303,8 @@ Prometheus en <http://localhost:9090> y Grafana en <http://localhost:3000> (`adm
 - El pod corre una imagen distinta a la de Docker Hub: el tag ya existía en la máquina (`imagePullPolicy: IfNotPresent` y OrbStack comparte el almacén con Docker). Publica con un tag nuevo.
 - `kubectl apply` dice que un Job (`airflow-init`, `train-db-migrate` o `rustfs-init`) es inmutable: aún no venció su TTL de 10 minutos. `kubectl -n real-estate delete job airflow-init train-db-migrate rustfs-init --ignore-not-found` y vuelve a aplicar. Con Argo CD no ocurre: son hooks de Sync y se recrean en cada sincronización.
 - MLflow responde `403` o la UI carga sin runs desde otra máquina: añade el host a `MLFLOW_ALLOWED_HOSTS` y el origen a `MLFLOW_CORS_ALLOWED_ORIGINS` en `.env`, corre `bash infra/k8s/scripts/render-env.sh` y commitea `infra/k8s/settings` (en compose basta con `.env`).
+- Jaeger no muestra trazas: `OTEL_EXPORTER_OTLP_ENDPOINT` debe ser `http://jaeger:4318` en `.env`; tras cambiarlo, corre `bash infra/k8s/scripts/render-env.sh` y commitea `infra/k8s/settings`. Vacía apaga el tracing.
+- El pod de Grafana queda en `CreateContainerConfigError`: falta el Secret `grafana-credentials`. Corre `bash infra/k8s/scripts/render-env.sh` y `kubectl apply -k infra/k8s/generated`.
 - Los hosts `*.k8s.orb.local` solo existen en OrbStack. En un servidor Linux sustitúyelos en `infra/k8s/base/gateway/httproutes.yaml` por el nombre Tailscale del nodo y expón el controller con el LoadBalancer o NodePort del clúster.
 
 ## Evidencias

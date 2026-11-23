@@ -137,7 +137,7 @@ Muestra el cálculo en la tabla del reporte.
 
 ### 8. Reportar
 - Escribe el reporte siguiendo **exactamente** `plantilla-reporte.md`, en español.
-- Guárdalo en la raíz del repo como `evaluacion_<repo>_<AAAAMMDD-HHMM>.md`. Es un archivo local de trabajo: no lo agregues a git.
+- Guárdalo en la carpeta `docs/` del repo como `docs/evaluacion_<repo>_<AAAAMMDD-HHMM>.md` (créala si no existe). No hagas commit del reporte: el equipo decide si lo versiona.
 - En el chat muestra:
   1. la nota final;
   2. la tabla de criterios;

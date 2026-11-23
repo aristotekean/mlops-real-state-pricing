@@ -202,29 +202,29 @@
       "id": 11,
       "type": "timeseries",
       "title": "CPU del pod de la API",
-      "description": "rate(process_cpu_seconds_total[1m]) — núcleos consumidos.",
+      "description": "rate(process_cpu_seconds_total[1m]) — núcleos consumidos, una serie por pod.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "legendFormat": "CPU (cores)",
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "legendFormat": "{{instance}}",
           "expr": "rate(process_cpu_seconds_total{job=\"real-estate-api\"}[1m])" }
       ],
       "options": { "legend": { "displayMode": "list", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "single", "sort": "none" } },
-      "fieldConfig": { "defaults": { "unit": "none", "min": 0, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 15, "showPoints": "never" }, "color": { "mode": "fixed", "fixedColor": "purple" } }, "overrides": [] }
+      "fieldConfig": { "defaults": { "unit": "none", "min": 0, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 15, "showPoints": "never" }, "color": { "mode": "palette-classic" } }, "overrides": [] }
     },
     {
       "id": 12,
       "type": "timeseries",
       "title": "Memoria del pod de la API",
-      "description": "process_resident_memory_bytes — RSS del proceso.",
+      "description": "process_resident_memory_bytes — RSS del proceso, una serie por pod.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "legendFormat": "RSS",
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "legendFormat": "{{instance}}",
           "expr": "process_resident_memory_bytes{job=\"real-estate-api\"}" }
       ],
       "options": { "legend": { "displayMode": "list", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "single", "sort": "none" } },
-      "fieldConfig": { "defaults": { "unit": "bytes", "min": 0, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 15, "showPoints": "never" }, "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] }
+      "fieldConfig": { "defaults": { "unit": "bytes", "min": 0, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 15, "showPoints": "never" }, "color": { "mode": "palette-classic" } }, "overrides": [] }
     },
     {
       "id": 102,
