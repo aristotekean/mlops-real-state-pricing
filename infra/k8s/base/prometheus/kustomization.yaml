@@ -1,0 +1,16 @@
+# S8 · Prometheus scraping the /metrics endpoint of every api-inference pod,
+# discovered through the Kubernetes API. Reached as `prometheus` on port 9090
+# (Grafana's datasource) and from outside through the Gateway.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - rbac.yaml
+  - statefulset.yaml
+  - service.yaml
+  - service-headless.yaml
+
+configMapGenerator:
+  - name: prometheus-config
+    files:
+      - prometheus.yml

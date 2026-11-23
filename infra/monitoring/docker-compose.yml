@@ -1,4 +1,8 @@
-# Real Estate MLOps · observability stack (Server C)
+# Real Estate MLOps · observability stack for the compose deployment
+#
+# On Kubernetes, Prometheus, Grafana and Jaeger run in the cluster instead
+# (infra/k8s/base/prometheus, grafana and jaeger); this file serves the
+# compose stack.
 #
 #   S8 Prometheus  --->  scrapes api-inference:8000/metrics
 #   S9 Grafana     --->  queries Prometheus, serves the dashboard
@@ -17,11 +21,13 @@
 #   The "Real Estate · Inference API" dashboard is provisioned automatically.
 #   Jaeger      UI on http://localhost:16686  (JAEGER_UI_PORT)
 #
-# On a dedicated Server C (the API stack lives on Server A): run this file on
-# its own and point Prometheus at Server A by editing the scrape target in
-# prometheus/prometheus.yml (see infra/monitoring/README.md). The profile is
-# required here too, otherwise compose starts nothing; the settings file is
-# passed explicitly because the project directory is then this folder:
+# On a dedicated server (the API stack lives elsewhere): run this file on its
+# own and point Prometheus at the API by editing the scrape target in
+# prometheus/targets/api-targets.yml (see infra/monitoring/README.md). The
+# Grafana mounts reach into infra/k8s/base/grafana, so copy the repository,
+# not only this folder. The profile is required here too, otherwise compose
+# starts nothing; the settings file is passed explicitly because the project
+# directory is then this folder:
 #   docker compose --env-file ../../.env -f docker-compose.yml --profile monitoring up -d
 #
 # Settings come from .env at the repository root (PROMETHEUS_PORT,
@@ -58,7 +64,7 @@ services:
   # ------------------------------------------------------------------------- #
   # S9 · Grafana (dashboards)
   #
-  # Datasource and dashboard are provisioned from infra/monitoring/grafana, so
+  # Datasource and dashboard are provisioned from infra/k8s/base/grafana, so
   # the "Real Estate · Inference API" dashboard is present on first start with no
   # manual setup.
   # ------------------------------------------------------------------------- #
@@ -75,8 +81,10 @@ services:
     ports:
       - "${GRAFANA_PORT:?}:3000"
     volumes:
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      # Single copy of the Grafana configuration, shared with the cluster
+      # (infra/k8s/base/grafana generates its ConfigMaps from these files).
+      - ../k8s/base/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../k8s/base/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
     depends_on:
       prometheus:
@@ -95,8 +103,7 @@ services:
   # Jaeger v2 all-in-one: OTLP/HTTP receiver on 4318, UI and query API on
   # 16686. Traces are kept in memory and are lost when the container restarts.
   # Inside the compose network the services reach it as http://jaeger:4318;
-  # the published OTLP port is for exporters outside it (the cluster, another
-  # server).
+  # the published OTLP port is for exporters outside it (another server).
   # ------------------------------------------------------------------------- #
   jaeger:
     image: jaegertracing/jaeger:2.23.0

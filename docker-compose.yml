@@ -24,7 +24,8 @@
 # Locust (Server B) is behind the `loadtest` profile, so it never starts by
 # default and does not compete with the API for CPU:
 #   docker compose --profile loadtest up -d     # see infra/load-testing
-# Prometheus + Grafana (Server C) are behind the `monitoring` profile:
+# Prometheus + Grafana + Jaeger are behind the `monitoring` profile (on
+# Kubernetes all three run in the cluster, infra/k8s/base):
 #   docker compose --profile monitoring up -d   # full stack + monitoring
 #   docker compose up -d prometheus grafana     # monitoring only (naming a
 #                                               # service enables its profile)

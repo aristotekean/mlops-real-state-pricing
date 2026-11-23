@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-End-to-end MLOps platform that estimates real estate prices (regression on `price`). Airflow pulls batches from the course Data API, lands them in PostgreSQL (RAW → CLEAN), decides by explicit rules whether to retrain, registers the candidate in MLflow and moves the `production` alias only if it beats the current model. A FastAPI service serves `models:/real_estate@production` and a Streamlit frontend consumes it. Server A runs on Kubernetes (OrbStack, namespace `real-estate`); Locust (Server B) and Prometheus + Grafana (Server C) run from compose profiles.
+End-to-end MLOps platform that estimates real estate prices (regression on `price`). Airflow pulls batches from the course Data API, lands them in PostgreSQL (RAW → CLEAN), decides by explicit rules whether to retrain, registers the candidate in MLflow and moves the `production` alias only if it beats the current model. A FastAPI service serves `models:/real_estate@production` and a Streamlit frontend consumes it. Everything runs on Kubernetes (OrbStack, namespace `real-estate`), Prometheus, Grafana and Jaeger included; Locust (Server B) stays outside the cluster on purpose, run from a compose profile on another machine over Tailscale, so the load generator does not compete with the API for CPU.
 
 The repository was bootstrapped from a diabetes-readmission scaffold. Parts of `README.md` (44-field form, class probabilities, MinIO, ingress-nginx, `notebooks/`) and its evidence captions still describe that project. The code is the source of truth: `ml/real_estate_model/src/real_estate_model/contract.py` for the contract, documented in `docs/data-contract.md`, and `docs/pipeline.md` for the pipeline.
 
@@ -34,7 +34,7 @@ uv run --no-project --with-requirements services/airflow/tests/requirements.txt 
 # Compose stack (every variable must exist in .env; there are no defaults)
 cp .env.example .env && docker compose up -d --build
 docker compose --profile loadtest up -d        # Locust
-docker compose up -d prometheus grafana        # monitoring only
+docker compose up -d prometheus grafana        # monitoring of the compose stack only
 
 # Kubernetes
 bash infra/k8s/scripts/check.sh                # pre-commit: render .env, kustomize build, migrations drift
@@ -67,7 +67,7 @@ kubectl apply -k infra/k8s/generated && kubectl apply -k infra/k8s
 
 `create_app` in `main.py` takes its dependencies (model registry functions, inference-log repository) as arguments; tests inject the in-memory fakes from `tests/conftest.py`. `ModelService` polls the registry alias every `MODEL_REFRESH_SECONDS` and swaps the model without a restart; with no `production` model, `/predict` returns 503 and `/health` returns 200 with `model_loaded=false`. Kubernetes probes use `/live` (no dependencies) and `/ready` (503 while the startup load is still running), never `/health`. Predictions run on a bounded thread pool: past `PREDICT_MAX_WORKERS + PREDICT_MAX_PENDING` in flight `/predict` answers 503 `overloaded`, and a new model must pass a smoke prediction before it is swapped in. Every request is written to `inference.logs` on `postgres-train` through `DurableInferenceLog`, which spools rows to a JSONL file while the database is down (a circuit skips the database until a replay succeeds) and replays them later. `/history` exposes `audit.batch_history` to the frontend, which talks only to this API.
 
-Tracing is OpenTelemetry exported over OTLP/HTTP to Jaeger (`jaeger` service in `infra/monitoring`), enabled only when `OTEL_EXPORTER_OTLP_ENDPOINT` is non-empty. The trace starts in the frontend (`requests` instrumentation, `frontend/tracing.py`) and the API continues it (`api_inference/tracing.py`). The provider is passed explicitly to `create_app(tracer_provider=...)` and never registered globally, so tests assert on an in-memory exporter. The `opentelemetry-*` pins in both services move together and must stay compatible with the `opentelemetry-sdk` that `mlflow` resolves.
+Tracing is OpenTelemetry exported over OTLP/HTTP to Jaeger (`infra/k8s/base/jaeger` in the cluster, `jaeger` service of `infra/monitoring` in compose; `http://jaeger:4318` in both), enabled only when `OTEL_EXPORTER_OTLP_ENDPOINT` is non-empty. The trace starts in the frontend (`requests` instrumentation, `frontend/tracing.py`) and the API continues it (`api_inference/tracing.py`). The provider is passed explicitly to `create_app(tracer_provider=...)` and never registered globally, so tests assert on an in-memory exporter. The `opentelemetry-*` pins in both services move together and must stay compatible with the `opentelemetry-sdk` that `mlflow` resolves.
 
 ### Database
 
@@ -78,6 +78,7 @@ Tracing is OpenTelemetry exported over OTLP/HTTP to Jaeger (`jaeger` service in 
 - `base/<component>` holds the manifests; `kustomization.yaml` at the root composes them. `settings/` and `base/postgres-train/migrations-configmap.yaml` are **generated and committed**: edit `.env` or `infra/database` and re-render, never by hand. Kustomize cannot read files outside its root, which is why they are rendered.
 - Secrets live in `infra/k8s/generated/` (git-ignored), have fixed names and are applied by hand. Argo CD never sees them; after a credential change, re-apply and `rollout restart`.
 - Argo CD (`infra/argocd/application.yaml`) syncs `infra/k8s` on `main` with prune and self-heal, so manual cluster edits are reverted. The init and migration Jobs are Sync hooks and re-run on every sync.
+- Prometheus discovers the api-inference pods through the Kubernetes API (`base/prometheus`, namespaced Role); its job name `real-estate-api` is what the dashboard filters on. `base/grafana/provisioning` and `base/grafana/dashboards` are the single copy of the Grafana configuration: kustomize generates the ConfigMaps from them and `infra/monitoring/docker-compose.yml` mounts the same directories.
 - `infra/k8s/traefik` (Gateway API controller) is installed separately, once, and is not part of the Argo CD application.
 - The project images are referenced without a tag in the manifests; the three `newTag` values in `infra/k8s/kustomization.yaml` are rewritten by CI.
 - `data-api` is the instructor's image, published for amd64 only; it is pinned by digest so it runs on arm64 nodes.

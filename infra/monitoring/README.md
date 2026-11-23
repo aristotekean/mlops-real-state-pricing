@@ -1,4 +1,11 @@
-# Observabilidad · Server C (Prometheus + Grafana + Jaeger)
+# Observabilidad · Prometheus + Grafana + Jaeger
+
+> En Kubernetes, Prometheus, Grafana y Jaeger corren **dentro del clúster**
+> (`infra/k8s/base/prometheus`, `infra/k8s/base/grafana` e
+> `infra/k8s/base/jaeger`): Prometheus descubre cada pod de la API por la API de
+> Kubernetes, Grafana se aprovisiona desde ConfigMaps y Jaeger recibe las trazas
+> en el Service `jaeger`. Esta carpeta levanta el mismo monitoreo para el stack
+> de compose.
 
 Stack de monitoreo de la API de inferencia. Prometheus recolecta las métricas
 que la API expone en `/metrics`; Grafana las visualiza en el dashboard
@@ -59,7 +66,7 @@ Cubre los mínimos exigidos por el enunciado y añade observabilidad de dominio:
 **Tráfico HTTP** — solicitudes totales · req/s · latencia promedio · p95 (KPIs);
 serie p50/p95/p99; solicitudes por código de estado; por endpoint; nº de errores
 y tasa de error (KPI y en el tiempo).
-**Recursos del pod** — CPU y memoria de la API.
+**Recursos del pod** — CPU y memoria de la API, una serie por pod.
 **MLOps** — predicciones por resultado; latencia de predicción p50/p95/p99;
 recargas de modelo; solicitudes en curso; fallos de log.
 
@@ -90,13 +97,12 @@ docker compose --env-file ../../.env -f docker-compose.yml --profile monitoring 
 | Jaeger | <http://localhost:16686> | — |
 
 Grafana abre directamente en el dashboard **Real Estate · Inference API** (datasource
-y dashboard se aprovisionan solos desde `grafana/provisioning`).
+y dashboard se aprovisionan solos desde `infra/k8s/base/grafana`, la única
+copia, compartida con el clúster).
 
 Prometheus hace scrape del target definido en
 [`prometheus/targets/api-targets.yml`](prometheus/targets/api-targets.yml)
-(`api-inference.real-estate.svc.cluster.local:8000`). Por defecto apunta a la
-API del clúster Kubernetes: OrbStack resuelve los Services del clúster desde los
-contenedores. Con el stack de compose usar `api-inference:8000`. Si la API no es
+(`api-inference:8000`, la API del stack de compose). Si la API no es
 alcanzable, el target aparece como **DOWN** (Status → Targets) y sus paneles
 muestran "No data".
 
@@ -160,7 +166,8 @@ crean spans ni abren conexiones. La dirección depende de dónde corren:
 | Dónde corren la API y el frontend | Valor |
 |-----------------------------------|-------|
 | compose raíz, junto a Jaeger | `http://jaeger:4318` |
-| Kubernetes u otra máquina | `http://<host de Server C>:<JAEGER_OTLP_PORT>`, una dirección alcanzable desde los pods |
+| Kubernetes | `http://jaeger:4318`, el Service de `infra/k8s/base/jaeger` (UI en <http://jaeger.k8s.orb.local>) |
+| Otra máquina | `http://<host de Jaeger>:<JAEGER_OTLP_PORT>`, una dirección alcanzable desde la API y el frontend |
 
 En Kubernetes el valor llega por los ConfigMaps `api-inference-env` y
 `frontend-env`: se cambia en `.env`, se vuelve a ejecutar
@@ -184,7 +191,9 @@ reiniciarlo. Si Jaeger no está arriba, la exportación falla en segundo plano
 
 Cuando el monitoreo corre en una máquina aparte del clúster, apunta el scrape a
 la dirección de la API en `prometheus/targets/api-targets.yml` (host:puerto
-alcanzable desde Server C) y levanta el stack con `docker-compose.yml`.
+alcanzable desde Server C) y levanta el stack con `docker-compose.yml`. Grafana
+monta su configuración desde `infra/k8s/base/grafana`, así que hay que copiar
+el repositorio, no solo esta carpeta.
 Prometheus recarga el target sin reiniciar (`file_sd`).
 
 ### Conectar Server C a la red Tailscale (opcional, instalado en el host)
@@ -253,10 +262,11 @@ infra/monitoring/
 │   ├── prometheus.yml                    configuración de scrape (file_sd)
 │   └── targets/
 │       └── api-targets.yml               target de la API (editable por entorno)
-└── grafana/
-    ├── provisioning/
-    │   ├── datasources/datasource.yml    Prometheus (uid: prometheus, URL por env)
-    │   └── dashboards/dashboards.yml      provider de dashboards
-    └── dashboards/
-        └── real-estate-api.json              dashboard principal
+
+infra/k8s/base/grafana/                   configuración de Grafana (compose y clúster)
+├── provisioning/
+│   ├── datasources/datasource.yml        Prometheus (uid: prometheus)
+│   └── dashboards/dashboards.yml         provider de dashboards
+└── dashboards/
+    └── real-estate-api.json              dashboard principal
 ```

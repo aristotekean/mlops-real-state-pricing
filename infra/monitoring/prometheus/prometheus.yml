@@ -1,9 +1,10 @@
-# Prometheus scrape configuration · Server C (observability)
+# Prometheus scrape configuration for the compose deployment. The cluster has
+# its own in infra/k8s/base/prometheus/prometheus.yml, with pod discovery.
 #
 # Scrapes the Inference API's /metrics endpoint. The target lives in
-# prometheus/targets/api-targets.yml: by default the Kubernetes Service (OrbStack
-# resolves it from containers); in the local compose stack use `api-inference:8000`;
-# on a dedicated Server C, Server A's address/port (see infra/monitoring/README.md).
+# prometheus/targets/api-targets.yml: by default `api-inference:8000` on the
+# compose network; the API's host:port when it runs on another machine (see
+# infra/monitoring/README.md).
 #
 # The S3 artifact store is RustFS, which exposes no Prometheus metrics endpoint,
 # so there is no artifact-store scrape job (unlike a MinIO-based setup).
@@ -17,9 +18,8 @@ global:
 scrape_configs:
   # The service under observation. The target lives in a separate file
   # (prometheus/targets/api-targets.yml) so it can be changed per deployment
-  # without editing this config: the cluster Service on OrbStack (default),
-  # `api-inference:8000` on the local compose network, or Server A's address
-  # (host:port) from a dedicated Server C.
+  # without editing this config: `api-inference:8000` on the local compose
+  # network (default) or the API's host:port when it runs on another machine.
   # file_sd reloads the target automatically.
   - job_name: real-estate-api
     metrics_path: /metrics

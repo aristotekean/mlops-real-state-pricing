@@ -1,0 +1,24 @@
+# S9 · Grafana serving the "Real Estate · Inference API" dashboard on top of
+# the Prometheus of base/prometheus. Reached as `grafana` on port 3000 and from
+# outside through the Gateway.
+#
+# provisioning/ and dashboards/ are the single copy of the Grafana
+# configuration: the ConfigMaps below are generated from them, and the compose
+# service in infra/monitoring/docker-compose.yml mounts the same directories.
+# The datasource URL (http://prometheus:9090) resolves in both: the Service of
+# base/prometheus here, the compose service name there.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - deployment.yaml
+  - service.yaml
+
+configMapGenerator:
+  - name: grafana-provisioning
+    files:
+      - provisioning/datasources/datasource.yml
+      - provisioning/dashboards/dashboards.yml
+  - name: grafana-dashboards
+    files:
+      - dashboards/real-estate-api.json

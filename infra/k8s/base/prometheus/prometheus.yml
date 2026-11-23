@@ -1,0 +1,49 @@
+# Prometheus scrape configuration for the cluster (S8). The compose stack has
+# its own in infra/monitoring/prometheus/prometheus.yml, with a static target.
+#
+# The S3 artifact store is RustFS, which exposes no Prometheus metrics
+# endpoint, so there is no artifact-store scrape job.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: real-estate-mlops
+
+scrape_configs:
+  # One target per api-inference pod, discovered through the Kubernetes API
+  # (Role in rbac.yaml). Scraping the Service instead would hit a different
+  # pod on every scrape once the HPA runs more than one, and the counters
+  # would jump between pods. The job name is what the Grafana dashboard
+  # filters on; keep it in sync with base/grafana/dashboards.
+  - job_name: real-estate-api
+    metrics_path: /metrics
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          own_namespace: true
+        selectors:
+          - role: pod
+            label: app.kubernetes.io/name=api-inference
+    relabel_configs:
+      # A pod yields one target per declared container port, plus a port-less
+      # one per container without ports (the init container): keep the API
+      # port only.
+      - source_labels: [__meta_kubernetes_pod_container_port_name]
+        regex: http
+        action: keep
+      # Pods that finished or were evicted stay listed until they are deleted.
+      - source_labels: [__meta_kubernetes_pod_phase]
+        regex: Succeeded|Failed
+        action: drop
+      # The pod name instead of its IP:port, so the series of each replica are
+      # readable in the dashboard legends.
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: instance
+      - target_label: service
+        replacement: api-inference
+
+  # Prometheus scraping itself (useful to confirm the stack is alive).
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

@@ -1,0 +1,10 @@
+# S10 · Jaeger receiving the traces api-inference and the frontend export over
+# OTLP/HTTP. Reached as `jaeger` on port 4318 (the same name as in compose, so
+# OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318 works in both) and its UI
+# from outside through the Gateway.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - deployment.yaml
+  - service.yaml
