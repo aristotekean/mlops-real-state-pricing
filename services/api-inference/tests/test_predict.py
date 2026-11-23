@@ -190,3 +190,18 @@ def test_feature_schema_exposes_all_contract_inputs():
     assert "house_size" in properties
     assert "price" not in properties and "street" not in properties
     assert PredictFeatures.model_config.get("extra") == "forbid"
+
+
+async def test_openapi_predict_example_is_a_scorable_listing(running_client):
+    """Swagger's "Try it out" must be prefilled with a request the model can
+    score, not with the type placeholders ("string", 0) it derives by default."""
+    from api_inference.model import smoke_features
+
+    app, *_ = make_app(registry=FakeRegistry(model=FakeModel(price=425_000.0)))
+    client = await running_client(app)
+    schema = (await client.get("/openapi.json")).json()
+    examples = schema["components"]["schemas"]["PredictRequest"]["examples"]
+
+    assert examples == [{"features": smoke_features()}]
+    response = await client.post("/predict", json=examples[0])
+    assert response.status_code == 200

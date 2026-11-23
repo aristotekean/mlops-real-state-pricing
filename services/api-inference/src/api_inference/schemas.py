@@ -17,6 +17,8 @@ from pydantic import (
     create_model,
 )
 
+from api_inference.model import smoke_features
+
 
 class HealthResponse(BaseModel):
     status: Literal["ok"]
@@ -95,7 +97,14 @@ PredictFeatures = create_model(
 
 
 class PredictRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # The example prefills Swagger's "Try it out" with a listing the model can
+    # score: the placeholders it derives from the types ("string", 0) pass
+    # validation and then fail in the model (a date that is not a date).
+    # ``request_id`` is left out so every execution gets a fresh one.
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"examples": [{"features": smoke_features()}]},
+    )
 
     request_id: UUID | None = Field(
         default=None, description="Idempotency/audit key; generated when omitted."
