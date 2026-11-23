@@ -264,7 +264,7 @@ También responde a una petición en lenguaje natural, por ejemplo "evalúa mi p
 - No ejecuta el proyecto: revisa el código, el historial de git y la evidencia del README, y abre cada imagen para comprobar que coincide con su descripción.
 - Evalúa lo que hay en disco, con los cambios sin commit incluidos, y avisa qué falta publicar: el profesor solo ve lo que está en GitHub.
 - No tiene en cuenta los archivos ignorados por git, la carpeta `.claude/` ni los reportes anteriores.
-- Guarda el reporte como `evaluacion_<repo>_<fecha>.md` en la raíz del repositorio (ignorado por git). Los datos intermedios quedan en `/tmp`.
+- Guarda el reporte como `docs/evaluacion_<repo>_<fecha>.md` (ignorado por git). Los datos intermedios quedan en `/tmp`.
 - Antes de la fecha límite de la rúbrica la nota es provisional, y siempre es orientativa: la calificación oficial la asigna el profesor.
 
 ## Operación

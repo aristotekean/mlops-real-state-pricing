@@ -35,7 +35,7 @@ EXT_IMAGEN = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"}
 EXT_MODELO = {".pkl", ".pickle", ".joblib", ".h5", ".pt", ".pth", ".onnx", ".sav", ".keras", ".cbm"}
 MAX_LECTURA = 1_500_000  # bytes por archivo de texto
 EXCLUIR_PREFIJOS = (".claude/",)
-RX_REPORTE_PREVIO = re.compile(r"^evaluacion_[^/]*\.md$")
+RX_REPORTE_PREVIO = re.compile(r"^(docs/)?evaluacion_[^/]*\.md$")
 _LISTADOS = {}
 
 MENSAJES_GENERICOS = re.compile(

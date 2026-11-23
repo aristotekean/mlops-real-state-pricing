@@ -254,7 +254,7 @@ webserver_config.py
 .atl/
 
 # Reports written by the evaluar-proyecto-final-mlops skill
-/evaluacion_*.md
+/docs/evaluacion_*.md
 
 # ODD feature documents (local working notes)
 odd/
