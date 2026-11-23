@@ -47,7 +47,8 @@ HTTP_IN_PROGRESS = Gauge(
 PREDICTIONS = Counter(
     "predictions_total",
     "Prediction requests by outcome "
-    "(succeeded, validation_error, model_unavailable, inference_error).",
+    "(succeeded, validation_error, model_unavailable, overloaded, "
+    "inference_timeout, inference_error).",
     ["status"],
 )
 PREDICTION_DURATION = Histogram(

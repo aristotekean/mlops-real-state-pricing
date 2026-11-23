@@ -2,6 +2,8 @@
 #
 #   S8 Prometheus  --->  scrapes api-inference:8000/metrics
 #   S9 Grafana     --->  queries Prometheus, serves the dashboard
+#   S10 Jaeger     <---  receives the traces api-inference and the frontend
+#                        export over OTLP/HTTP, serves the trace UI
 #
 # Included by the root docker-compose.yml under the `monitoring` profile, so a
 # plain `docker compose up` never starts it. Paths are relative to this file.
@@ -9,10 +11,11 @@
 # Local, with the full stack (from the repository root):
 #   docker compose --profile monitoring up -d --build
 # Monitoring only (naming a service enables its profile):
-#   docker compose up -d prometheus grafana
+#   docker compose up -d prometheus grafana jaeger
 #   Prometheus UI on http://localhost:9090
 #   Grafana     UI on http://localhost:3000   (GRAFANA_ADMIN_USER / _PASSWORD)
 #   The "Real Estate · Inference API" dashboard is provisioned automatically.
+#   Jaeger      UI on http://localhost:16686  (JAEGER_UI_PORT)
 #
 # On a dedicated Server C (the API stack lives on Server A): run this file on
 # its own and point Prometheus at Server A by editing the scrape target in
@@ -23,7 +26,7 @@
 #
 # Settings come from .env at the repository root (PROMETHEUS_PORT,
 # PROMETHEUS_RETENTION, GRAFANA_PORT, GRAFANA_ADMIN_USER,
-# GRAFANA_ADMIN_PASSWORD; see .env.example).
+# GRAFANA_ADMIN_PASSWORD, JAEGER_UI_PORT, JAEGER_OTLP_PORT; see .env.example).
 
 services:
   # ------------------------------------------------------------------------- #
@@ -84,6 +87,24 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------------- #
+  # S10 · Jaeger (distributed traces of the inference requests)
+  #
+  # Jaeger v2 all-in-one: OTLP/HTTP receiver on 4318, UI and query API on
+  # 16686. Traces are kept in memory and are lost when the container restarts.
+  # Inside the compose network the services reach it as http://jaeger:4318;
+  # the published OTLP port is for exporters outside it (the cluster, another
+  # server).
+  # ------------------------------------------------------------------------- #
+  jaeger:
+    image: jaegertracing/jaeger:2.23.0
+    profiles: [ "monitoring" ]
+    container_name: real-estate-jaeger
+    ports:
+      - "${JAEGER_UI_PORT:?}:16686"
+      - "${JAEGER_OTLP_PORT:?}:4318"
     restart: unless-stopped
 
 volumes:

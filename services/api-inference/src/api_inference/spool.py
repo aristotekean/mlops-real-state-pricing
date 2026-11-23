@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from dataclasses import asdict, fields
 from datetime import datetime
 from pathlib import Path
@@ -46,6 +47,10 @@ _RECORD_FIELDS = {field.name for field in fields(InferenceLogRecord)}
 IN_FLIGHT_SUFFIX = ".replaying"
 
 
+class SpoolFullError(Exception):
+    """The spool reached its size limit; the row is dropped, not written."""
+
+
 def is_permanent_failure(exc: BaseException) -> bool:
     """True when retrying the same row can never succeed."""
     return isinstance(exc, psycopg.errors.IntegrityError | psycopg.errors.DataError)
@@ -56,6 +61,8 @@ def encode_record(record: InferenceLogRecord) -> str:
     payload["request_id"] = str(record.request_id)
     if record.requested_at is not None:
         payload["requested_at"] = record.requested_at.isoformat()
+    if record.trace_id is None:
+        del payload["trace_id"]
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -86,11 +93,26 @@ class InferenceLogSpool:
     ``DurableInferenceLog`` serialises file access with a lock.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, max_bytes: int | None = None) -> None:
         self.path = path
         self.in_flight_path = path.with_name(path.name + IN_FLIGHT_SUFFIX)
+        self.max_bytes = max_bytes
+
+    def size(self) -> int:
+        """Bytes on disk across both files, without reading them."""
+        total = 0
+        for path in (self.path, self.in_flight_path):
+            try:
+                total += path.stat().st_size
+            except FileNotFoundError:
+                pass
+        return total
 
     def append(self, record: InferenceLogRecord) -> None:
+        """Append one row; raises ``SpoolFullError`` once ``max_bytes`` is
+        reached so a long outage cannot fill the volume."""
+        if self.max_bytes is not None and self.size() >= self.max_bytes:
+            raise SpoolFullError(f"spool reached {self.max_bytes} bytes")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(encode_record(record) + "\n")
@@ -149,37 +171,69 @@ class InferenceLogSpool:
 
 
 class DurableInferenceLog:
-    """Repository writes with an on-disk fallback and ordered replay."""
+    """Repository writes with an on-disk fallback and ordered replay.
+
+    A transient database failure opens a circuit for ``retry_after_seconds``:
+    while it is open, ``write`` goes straight to the spool instead of making
+    every request wait for a connection that is not there. A replay that
+    drains the spool closes it; a replay that fails keeps it open. ``0``
+    disables the circuit (every write tries the database first).
+    """
 
     def __init__(
-        self, repository: InferenceLogRepository, spool: InferenceLogSpool | None
+        self,
+        repository: InferenceLogRepository,
+        spool: InferenceLogSpool | None,
+        retry_after_seconds: float = 0.0,
     ) -> None:
         self._repository = repository
         self._spool = spool
         self._lock = asyncio.Lock()
+        self._retry_after_seconds = retry_after_seconds
+        self._database_down_until = 0.0
+        self._pending: int | None = None
 
     @property
     def spool_path(self) -> Path | None:
         return self._spool.path if self._spool else None
 
+    def _circuit_open(self) -> bool:
+        return time.monotonic() < self._database_down_until
+
+    def _open_circuit(self) -> None:
+        if self._retry_after_seconds > 0:
+            self._database_down_until = time.monotonic() + self._retry_after_seconds
+
     async def write(self, record: InferenceLogRecord) -> bool:
         """Persist the row now, or spool it; never raises. True when stored."""
-        try:
-            await self._repository.log(record)
-            return True
-        except Exception as exc:
-            if self._spool is None or is_permanent_failure(exc):
-                INFERENCE_LOG_FAILURES.inc()
-                logger.exception("inference log write failed for request %s", record.request_id)
-                return False
-            logger.warning(
-                "inference log write failed for request %s, spooling: %s",
-                record.request_id, exc,
-            )
+        if self._spool is None or not self._circuit_open():
+            try:
+                await self._repository.log(record)
+                return True
+            except Exception as exc:
+                if self._spool is None or is_permanent_failure(exc):
+                    INFERENCE_LOG_FAILURES.inc()
+                    logger.exception(
+                        "inference log write failed for request %s", record.request_id
+                    )
+                    return False
+                self._open_circuit()
+                logger.warning(
+                    "inference log write failed for request %s, spooling: %s",
+                    record.request_id, exc,
+                )
         try:
             async with self._lock:
                 await asyncio.to_thread(self._spool.append, record)
-                INFERENCE_LOG_SPOOL_PENDING.set(await asyncio.to_thread(self._spool.pending))
+                if self._pending is None:
+                    self._pending = await asyncio.to_thread(self._spool.pending)
+                else:
+                    self._pending += 1
+                INFERENCE_LOG_SPOOL_PENDING.set(self._pending)
+        except SpoolFullError as exc:
+            INFERENCE_LOG_FAILURES.inc()
+            logger.warning("dropping inference log for request %s: %s", record.request_id, exc)
+            return False
         except Exception:
             INFERENCE_LOG_FAILURES.inc()
             logger.exception("inference log spool append failed for request %s", record.request_id)
@@ -200,6 +254,7 @@ class DurableInferenceLog:
         async with self._lock:
             records = await asyncio.to_thread(self._spool.take)
             if not records:
+                self._pending = 0
                 INFERENCE_LOG_SPOOL_PENDING.set(0)
                 return 0
 
@@ -222,10 +277,12 @@ class DurableInferenceLog:
                             record.request_id, exc,
                         )
                         continue
+                    self._open_circuit()
                     logger.warning("inference log replay paused, database unavailable: %s", exc)
                     break
             else:
                 remaining = []
+                self._database_down_until = 0.0
         finally:
             # Shielded so a task cancellation cannot skip the write-back.
             await asyncio.shield(self._settle(remaining))
@@ -237,4 +294,5 @@ class DurableInferenceLog:
     async def _settle(self, remaining: list[InferenceLogRecord]) -> None:
         async with self._lock:
             await asyncio.to_thread(self._spool.settle, remaining)
-            INFERENCE_LOG_SPOOL_PENDING.set(await asyncio.to_thread(self._spool.pending))
+            self._pending = await asyncio.to_thread(self._spool.pending)
+            INFERENCE_LOG_SPOOL_PENDING.set(self._pending)

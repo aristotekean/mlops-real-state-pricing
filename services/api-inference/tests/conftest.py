@@ -126,19 +126,30 @@ def make_service(registry: FakeRegistry, settings: Settings) -> ModelService:
         refresh_seconds=settings.model_refresh_seconds,
         resolve_version=registry.resolve,
         load_model=registry.load,
+        resolve_timeout_seconds=settings.model_resolve_timeout_seconds,
+        load_timeout_seconds=settings.model_load_timeout_seconds,
+        predict_max_workers=settings.predict_max_workers,
+        predict_max_pending=settings.predict_max_pending,
+        predict_timeout_seconds=settings.predict_timeout_seconds,
     )
 
 
 def make_app(
     registry: FakeRegistry | None = None,
     repository: InMemoryRepository | None = None,
+    tracer_provider: Any | None = None,
     **settings_overrides: Any,
 ):
     settings = make_settings(**settings_overrides)
     registry = registry or FakeRegistry()
     repository = repository or InMemoryRepository()
     service = make_service(registry, settings)
-    app = create_app(settings=settings, model_service=service, repository=repository)
+    app = create_app(
+        settings=settings,
+        model_service=service,
+        repository=repository,
+        tracer_provider=tracer_provider,
+    )
     return app, registry, repository, service
 
 

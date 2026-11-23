@@ -8,7 +8,9 @@ en la tabla `inference.logs` y publica métricas Prometheus.
 
 | Método | Ruta            | Descripción |
 | ------ | --------------- | ----------- |
-| GET    | `/health`       | Liveness. Siempre `200`; informa `model_loaded` y el estado de la base de datos (`ok`/`error`). |
+| GET    | `/live`         | Sonda de liveness. `200` mientras el proceso responde; no consulta la base de datos ni MLflow. |
+| GET    | `/ready`        | Sonda de readiness. `503` mientras la carga inicial del modelo sigue en curso; después `200` (con `READINESS_REQUIRES_MODEL=true`, solo si hay modelo cargado). |
+| GET    | `/health`       | Estado para personas y para el frontend. Siempre `200`; informa `model_loaded` y el estado de la base de datos (`ok`/`error`, ping acotado por `HEALTH_DB_TIMEOUT_SECONDS`). |
 | GET    | `/model-info`   | Nombre, alias, versión, `run_id`, estado (`ready`/`unavailable`), `loaded_at`, última comprobación del alias y último error. |
 | POST   | `/model/reload` | Fuerza la recarga de la versión apuntada por el alias. Devuelve `previous_version`, `current_version` y `changed`. `503` si la carga falla (se conserva la versión anterior). |
 | POST   | `/predict`      | Una propiedad por petición; devuelve el precio estimado. Contrato en `docs/data-contract.md`. |
@@ -112,9 +114,28 @@ mecanismos:
    `MlflowClient().get_model_version_by_alias` y carga la versión concreta
    (`models:/<name>/<version>`). Hay reintentos acotados
    (`MODEL_LOAD_RETRIES`, backoff lineal `MODEL_LOAD_BACKOFF_SECONDS`). Si se
-   agotan, el proceso arranca igualmente en estado `unavailable`: `/health`
-   responde `200` con `model_loaded=false` y `/predict` responde `503` mientras
-   tanto. El contenedor no entra en bucle de reinicio.
+   agotan, el proceso sigue en estado `unavailable`: `/health` responde `200`
+   con `model_loaded=false` y `/predict` responde `503` mientras tanto. El
+   contenedor no entra en bucle de reinicio.
+
+   La carga no bloquea el arranque: el servidor espera como máximo
+   `MODEL_STARTUP_WAIT_SECONDS` y después abre el puerto mientras los
+   reintentos continúan en segundo plano. `/ready` responde `503` hasta que
+   esos intentos terminan, así un pod nuevo no recibe tráfico antes de haber
+   intentado cargar el modelo.
+
+   Cada llamada al registro tiene límite de tiempo
+   (`MODEL_RESOLVE_TIMEOUT_SECONDS`, `MODEL_LOAD_TIMEOUT_SECONDS`): una llamada
+   colgada a MLflow se registra como fallo y libera el `asyncio.Lock`, en
+   lugar de bloquear el refresco y `POST /model/reload`. Además la API fija
+   `MLFLOW_HTTP_REQUEST_TIMEOUT=15` y `MLFLOW_HTTP_REQUEST_MAX_RETRIES=2`
+   cuando no están definidas (los valores por defecto de MLflow, 120 s y 7
+   reintentos, superan los cuatro minutos).
+
+   Antes de sustituir el modelo en servicio, la versión recién cargada debe
+   devolver un precio finito para una propiedad de prueba. Si falla, la carga
+   cuenta como error (`smoke prediction failed`) y se conserva la versión
+   anterior.
 2. **Refresco en segundo plano.** Una tarea `asyncio` consulta el alias cada
    `MODEL_REFRESH_SECONDS` (60 por defecto; `0` la desactiva). Si la versión
    cambia, se carga la nueva y se sustituye la referencia bajo un
@@ -175,6 +196,17 @@ devuelve igual aunque falle. Lo que cambia es qué pasa con la fila:
   reintentar no sirve, la fila se descarta y cuenta en
   `inference_log_failures_total`.
 
+Tras un fallo transitorio se abre un circuito durante
+`INFERENCE_LOG_CIRCUIT_SECONDS`: mientras está abierto, las filas van directo
+al spool y las peticiones no esperan el timeout de conexión de una base de
+datos que no responde. Un replay que vacía el spool lo cierra; un replay que
+falla lo mantiene abierto.
+
+El spool tiene un tope (`INFERENCE_LOG_SPOOL_MAX_BYTES`). Al alcanzarlo, las
+filas nuevas se descartan y se cuentan en `inference_log_failures_total`, en
+lugar de llenar el volumen (en Kubernetes, superar el `sizeLimit` del
+`emptyDir` desaloja el pod y pierde el spool completo).
+
 Con el spool, "registrar cada solicitud" sobrevive a una caída de Postgres. El
 límite es el disco del proceso: en Kubernetes el volumen es `emptyDir`, así que
 sobrevive a la caída de la base de datos pero no a reprogramar el pod; en
@@ -208,7 +240,7 @@ Además se exportan los colectores por defecto (`process_*` en Linux,
 
 La API lee su configuración del entorno. En compose y en Kubernetes los valores
 salen del `.env` de la raíz del repositorio (`MLFLOW_*`, `MODEL_*`,
-`TRAIN_DB_*`; ver [`.env.example`](../../.env.example)); las demás variables de
+`TRAIN_DB_*`, `OTEL_*`; ver [`.env.example`](../../.env.example)); las demás variables de
 la tabla toman su valor por defecto.
 
 | Variable | Por defecto | Descripción |
@@ -217,11 +249,21 @@ la tabla toman su valor por defecto.
 | `MODEL_NAME` / `MODEL_ALIAS` | `real_estate` / `production` | Modelo registrado y alias servido. |
 | `MODEL_REFRESH_SECONDS` | `60` | Periodo del refresco en segundo plano; `0` lo desactiva. |
 | `MODEL_LOAD_RETRIES` / `MODEL_LOAD_BACKOFF_SECONDS` | `5` / `2` | Reintentos de la carga inicial. |
+| `MODEL_STARTUP_WAIT_SECONDS` | `5` | Espera máxima del arranque por la primera carga; después el puerto se abre y la carga sigue en segundo plano. |
+| `MODEL_RESOLVE_TIMEOUT_SECONDS` / `MODEL_LOAD_TIMEOUT_SECONDS` | `15` / `120` | Límite de una consulta del alias y de una descarga más predicción de prueba. |
+| `READINESS_REQUIRES_MODEL` | `false` | Con `true`, `/ready` responde `503` mientras no haya modelo cargado. Con `false`, pasa a `200` al terminar los intentos de arranque, para que `/history` y `/model-info` sigan accesibles sin modelo. |
+| `PREDICT_MAX_WORKERS` / `PREDICT_MAX_PENDING` | `4` / `64` | Hilos que ejecutan predicciones y predicciones que pueden esperar en cola; por encima, `/predict` responde `503` (`overloaded`) con `Retry-After`. |
+| `PREDICT_TIMEOUT_SECONDS` | `10` | Una predicción más lenta responde `504` (`inference_timeout`). |
+| `HEALTH_DB_TIMEOUT_SECONDS` | `1` | Límite del ping a la base de datos que informa `/health`. |
 | `TRAIN_DATABASE_URL` | — | DSN completo; tiene prioridad sobre las partes. |
 | `TRAIN_DB_HOST` / `TRAIN_DB_PORT` / `TRAIN_DB_NAME` / `TRAIN_DB_USER` / `TRAIN_DB_PASSWORD` | `—/5432/—/—/—` | Partes del DSN de `inference.logs`. |
 | `DB_POOL_MIN` / `DB_POOL_MAX` | `1` / `4` | Tamaño del pool async de psycopg. |
 | `INFERENCE_LOG_SPOOL_PATH` | `spool/inference-logs.jsonl` | Spool en disco para filas de `inference.logs` que la base de datos no aceptó (relativo al directorio de trabajo, `/app` en la imagen). Vacío lo desactiva. |
 | `INFERENCE_LOG_REPLAY_SECONDS` | `15` | Periodo del reintento en segundo plano del spool; `0` lo desactiva. |
+| `INFERENCE_LOG_CIRCUIT_SECONDS` | `30` | Tras un fallo de escritura, tiempo durante el que las filas van directo al spool; `0` intenta la base de datos en cada petición. |
+| `INFERENCE_LOG_SPOOL_MAX_BYTES` | `100663296` (96 MiB) | Tamaño máximo del spool; un replay mantiene dos copias por un momento, así que debe quedar por debajo de la mitad del volumen. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | — | URL base del receptor OTLP/HTTP de Jaeger (`http://jaeger:4318`). Vacía o ausente, el tracing queda apagado. Ver [`infra/monitoring`](../../infra/monitoring/README.md#trazas-jaeger). |
+| `OTEL_TRACES_SAMPLE_RATIO` | `1.0` | Fracción (de `0` a `1`) de solicitudes sin traza propia que se guardan; las iniciadas por el frontend siguen su decisión. |
 | `LOG_LEVEL` | `INFO` | Nivel de logging estándar. |
 
 ## Desarrollo local

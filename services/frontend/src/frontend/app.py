@@ -31,6 +31,7 @@ from frontend.fields import (
     to_widget_value,
     widget_options,
 )
+from frontend.tracing import configure_tracing
 from frontend.validation import validate_features
 
 API_URL = os.environ.get("API_URL", "http://localhost:8000")
@@ -40,6 +41,7 @@ st.set_page_config(page_title="Precios inmobiliarios", page_icon="🏠", layout=
 
 @st.cache_resource
 def get_client() -> ApiClient:
+    configure_tracing(os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"))
     return ApiClient(API_URL)
 
 
