@@ -4,6 +4,8 @@
 
 Plataforma MLOps de extremo a extremo para estimar el precio de propiedades inmobiliarias. Airflow consume la API de datos del curso lote a lote (grupo 6), valida cada lote, lo guarda en RAW y CLEAN, decide con reglas explícitas si reentrena y registra el candidato en MLflow, donde solo recibe el alias `production` si supera al modelo productivo; los artefactos viven en RustFS (almacén S3), una API FastAPI sirve `models:/real_estate@production` en `POST /predict` y un frontend Streamlit lo consulta. Todo Server A corre en Kubernetes (OrbStack) con autoescalado de la API; Locust (Server B) genera carga y Prometheus + Grafana (Server C) la observan.
 
+![Arquitectura de la plataforma](docs/images/1-arquitectura.svg)
+
 ## Ruta rápida
 
 1. Instalar en el clúster, una sola vez, los CRDs de Gateway API, Traefik como controlador y metrics-server (OrbStack no trae ninguno; el HPA necesita el último). Los CRDs van primero porque el `GatewayClass` de Traefik es uno de ellos:
@@ -61,8 +63,6 @@ Plataforma MLOps de extremo a extremo para estimar el precio de propiedades inmo
 > Mientras no exista un modelo con el alias `production`, `/predict` responde `503` y `/health` responde `200` con `model_loaded=false`. No hace falta reiniciar la API: consulta el registro cada `MODEL_REFRESH_SECONDS` y `POST /model/reload` fuerza la carga.
 
 ## Arquitectura
-
-![Arquitectura de la plataforma](docs/images/1-arquitectura.png)
 
 ```mermaid
 flowchart LR
@@ -304,52 +304,72 @@ Prometheus en <http://localhost:9090> y Grafana en <http://localhost:3000> (`adm
 
 ## Evidencias
 
-Las capturas se guardan en `docs/images/`. Cada apartado indica qué debe probar su captura; los marcados como *pendiente* todavía no tienen imagen.
+Las capturas se guardan en `docs/images/`. Cada apartado describe lo que muestra su captura.
 
 ### 1. CI/CD: GitHub Actions y Docker Hub
 
-- *Pendiente* · `docs/images/2-github-actions.png`: una ejecución en verde del workflow `CI Unit Tests + DockerHub Publish` con los jobs `unit-tests`, `publish-dockerhub` y `update-manifests`.
-- *Pendiente* · `docs/images/2-1-docker-hub-images.png`: los repositorios `real-estate-airflow`, `real-estate-frontend` y `real-estate-api-inference` del namespace `aristotekean`, con el tag del SHA del commit además de `latest`.
+Ejecución #9 del workflow `CI Unit Tests + DockerHub Publish` sobre `main` (commit `545df1b`), en verde: los tres jobs de `unit-tests`, los tres de `publish-dockerhub` y `update-manifests`.
+
+![Ejecución en verde del workflow de CI/CD en GitHub Actions](docs/images/gh%20actions.png)
+
+Repositorios `real-estate-api-inference`, `real-estate-frontend` y `real-estate-airflow` del namespace `aristotekean` en Docker Hub, publicados por esa ejecución.
+
+![Repositorios real-estate en Docker Hub](docs/images/docker%20hub.png)
 
 ### 2. Argo CD
 
-- *Pendiente* · `docs/images/3-argocd.png`: la Application `real-estate` en *Synced / Healthy* y una sincronización disparada por un commit `chore(infra): deploy real-estate images <sha>`.
+Application `real-estate` en *Healthy / Synced* contra `main` (`ea9922f`) con auto-sync activo. La vista de red muestra el Gateway `real-estate`, sus cuatro `HTTPRoute` (`airflow`, `api-inference`, `frontend`, `mlflow`) y los Services y pods a los que enrutan.
+
+![Application real-estate sincronizada en Argo CD](docs/images/argo.png)
 
 ### 3. Clúster de Kubernetes
 
-- *Pendiente* · `docs/images/4-kubernetes-pods.png`: `kubectl -n real-estate get pods` con `airflow`, `airflow-db`, `api-inference`, `data-api`, `frontend`, `mlflow`, `mlflow-db`, `postgres-train` y `rustfs` en ejecución.
-- *Pendiente* · `docs/images/4-1-kubernetes-resources.png`: `requests` y `limits` aplicados (`kubectl describe` o `kubectl top pods`) y el Gateway con sus `HTTPRoute`.
+Pods del namespace `real-estate` en ejecución en OrbStack (`airflow`, `airflow-db`, `api-inference`, `data-api`, `frontend`, `mlflow`, `mlflow-db`, `postgres-train` y `rustfs`), junto con los de `argocd`.
+
+![Pods de los namespaces argocd y real-estate en OrbStack](docs/images/k8s.png)
 
 ### 4. DAG en Airflow
 
-- *Pendiente* · `docs/images/5-airflow-grid.png`: varias corridas de `real_estate_incremental_training`, una por lote, donde se vean las ramas recorridas (`skip_training`, `promote_model`, `reject_model` y `no_new_batch`).
-- *Pendiente* · `docs/images/5-1-airflow-graph.png`: el grafo de una corrida, de `fetch_batch_from_api` a `notify_or_log_result`.
+Tres corridas programadas (`*/15 * * * *`) de `real_estate_incremental_training`, una por lote, sin tareas fallidas. Las tres recorren la rama `train_candidate_model` → `promote_model`; `no_new_batch`, `skip_training` y `reject_model` quedan omitidas.
 
-### 5. Datos, validaciones y auditoría
+![Grid del DAG real_estate_incremental_training con tres corridas exitosas](docs/images/airflow.png)
 
-- *Pendiente* · `docs/images/6-raw-clean.png`: filas de `raw.batches` y de `clean.records` agrupadas por `batch_id` y `data_split` (trazabilidad por lote).
-- *Pendiente* · `docs/images/6-1-validations-drift.png`: los reportes de validación y de drift (PSI) de un lote.
-- *Pendiente* · `docs/images/6-2-batch-history.png`: `audit.batch_history_summary` con la decisión y la razón de cada lote.
+### 5. MLflow y almacén de artefactos
 
-### 6. MLflow
+Experimento `real-estate-pricing` con un run por lote (`batch-0`, `batch-1` y `batch-2`), todos lanzados desde Airflow.
 
-- *Pendiente* · `docs/images/7-mlflow-run.png`: un run del experimento `real-estate-pricing` con métricas, parámetros, lotes usados, commit y razón del entrenamiento.
-- *Pendiente* · `docs/images/7-1-mlflow-registry.png`: el modelo registrado `real_estate` con sus versiones y el alias `production`.
-- *Pendiente* · `docs/images/7-2-promotion.png`: un candidato promovido y otro rechazado (o un lote no entrenado), con la comparación de métricas frente al productivo.
+![Runs del experimento real-estate-pricing en MLflow](docs/images/mlflow.png)
 
-### 7. API de inferencia
+Artefactos de un modelo registrado en el bucket `mlflow` de RustFS: `MLmodel`, `model.skops`, el entorno (`conda.yaml`, `python_env.yaml`, `requirements.txt`), los ejemplos de entrada y `code/` con el paquete `real_estate_model`.
 
-- *Pendiente* · `docs/images/8-api-docs.png`: `api.k8s.orb.local/docs` con `POST /predict`, `GET /health`, `GET /model-info`, `POST /model/reload` y `GET /history`.
-- *Pendiente* · `docs/images/8-1-model-reload.png`: `GET /model-info` antes y después de una promoción, con el mismo pod (misma edad en `kubectl get pods`): recarga sin redespliegue.
-- *Pendiente* · `docs/images/8-2-inference-logs.png`: filas de `inference.logs` con versión del modelo, estado y error.
+![Artefactos del modelo en el bucket mlflow de RustFS](docs/images/rustfs.png)
 
-### 8. Frontend
+### 6. API de inferencia
 
-- *Pendiente* · `docs/images/9-frontend-prediction.png`: una estimación de precio con el modelo `real_estate`, su versión y el alias `production`.
-- *Pendiente* · `docs/images/9-1-frontend-history.png`: la pestaña **Historial de entrenamiento** con los lotes recolectados.
+`POST /predict` desde `api.k8s.orb.local/docs`: respuesta `200` con el precio estimado y el modelo `real_estate` versión 3 con el alias `production`.
 
-### 9. Observabilidad y prueba de carga
+![Respuesta 200 de POST /predict en la documentación interactiva](docs/images/api.png)
 
-- *Pendiente* · `docs/images/10-prometheus-targets.png`: el target `real-estate-api` en estado *UP*.
-- *Pendiente* · `docs/images/10-1-locust.png`: la ejecución de Locust (usuarios, RPS y fallos).
-- *Pendiente* · `docs/images/10-2-grafana-load.png`: el dashboard **Real Estate · Inference API** durante la prueba (peticiones, latencia, errores, CPU y memoria).
+Filas de `inference.logs` en `postgres-train` con estado, código de error, versión del modelo, tiempo de procesamiento, predicción y `trace_id`. Se ven las peticiones rechazadas con `model_unavailable` antes de existir un modelo productivo y las predicciones servidas después por las versiones 1, 2 y 3.
+
+![Consulta de inference.logs con versión del modelo, estado y trace_id](docs/images/postgress-training.png)
+
+### 7. Frontend
+
+Estimación de precio desde `frontend.k8s.orb.local` con el modelo `real_estate` versión 2 y el alias `production`; la barra lateral muestra la API disponible y el modelo cargado.
+
+![Estimación de precio en el frontend de Streamlit](docs/images/frontend.png)
+
+### 8. Observabilidad y prueba de carga
+
+Tasa de peticiones a `/predict` por código de estado en Prometheus (`sum by (status) (rate(http_requests_total{path="/predict"}[5m]))`).
+
+![Tasa de peticiones a /predict por estado en Prometheus](docs/images/prometheus.png)
+
+Dashboard de Grafana, fila **Tráfico HTTP**: solicitudes totales y por segundo, latencia promedio y por percentiles (p50 / p95 / p99), errores y solicitudes por código de estado.
+
+![Dashboard de la API de inferencia en Grafana](docs/images/grafana.png)
+
+Traza distribuida en Jaeger: comienza en el frontend y continúa en api-inference (`POST /predict`), con los spans `model.predict` e `inference_log.write`. Su identificador (`ef5c88b1…`) es el `trace_id` de una de las filas de `inference.logs` del apartado 6.
+
+![Traza frontend → api-inference en Jaeger](docs/images/jaeger-tracing.png)
