@@ -321,6 +321,10 @@ Repositorios `real-estate-api-inference`, `real-estate-frontend` y `real-estate-
 
 ![Repositorios real-estate en Docker Hub](docs/images/docker%20hub.png)
 
+**Tag por SHA:** `real-estate-api-inference:547c020…` publicada en Docker Hub (`linux/amd64` y `linux/arm64`) es la misma imagen que usa el Deployment `api-inference`.
+
+![Imagen con tag SHA en Docker Hub y en el Deployment](docs/images/dockerhub-tag-sha.png)
+
 ### 2. Argo CD
 
 Application `real-estate` en *Healthy / Synced* contra `main` (`ea9922f`) con auto-sync activo. La vista de red muestra el Gateway `real-estate`, sus cuatro `HTTPRoute` (`airflow`, `api-inference`, `frontend`, `mlflow`) y los Services y pods a los que enrutan.
@@ -345,6 +349,14 @@ Experimento `real-estate-pricing` con un run por lote (`batch-0`, `batch-1` y `b
 
 ![Runs del experimento real-estate-pricing en MLflow](docs/images/mlflow.png)
 
+**Run del lote 2:** métricas del candidato, runs hijos (`hist_gradient_boosting`, `ridge`) y tags `batch_id`, `api_batch_number`, `clean_snapshot` y `training_reason`.
+
+![Run batch-2 en MLflow con métricas y tags de trazabilidad](docs/images/mlflow-run-lote.png)
+
+**Model Registry:** `real_estate` versión 3 con el alias `production`, entrenada con los lotes 0, 1 y 2 y con el motivo del entrenamiento.
+
+![Versión 3 de real_estate con alias production en el Model Registry](docs/images/mlflow-registry.png)
+
 Artefactos de un modelo registrado en el bucket `mlflow` de RustFS: `MLmodel`, `model.skops`, el entorno (`conda.yaml`, `python_env.yaml`, `requirements.txt`), los ejemplos de entrada y `code/` con el paquete `real_estate_model`.
 
 ![Artefactos del modelo en el bucket mlflow de RustFS](docs/images/rustfs.png)
@@ -359,11 +371,23 @@ Filas de `inference.logs` en `postgres-train` con estado, código de error, vers
 
 ![Consulta de inference.logs con versión del modelo, estado y trace_id](docs/images/postgress-training.png)
 
+**Recarga sin redespliegue:** el mismo pod `api-inference-7466fc46fb-7ntnt` (0 reinicios) pasa de servir la versión 3 a la 4 tras la promoción.
+
+![Mismo pod de api-inference sirviendo la versión 3 y luego la 4](docs/images/api-recarga-modelo.png)
+
 ### 7. Frontend
 
 Estimación de precio desde `frontend.k8s.orb.local` con el modelo `real_estate` versión 2 y el alias `production`; la barra lateral muestra la API disponible y el modelo cargado.
 
 ![Estimación de precio en el frontend de Streamlit](docs/images/frontend.png)
+
+**Historial por lote:** decisión de entrenamiento, promoción y versión de cada lote. El lote 3 no entrenó; los demás entrenaron y se promovieron.
+
+![Historial de entrenamiento y despliegue por lote en Streamlit](docs/images/frontend-historial.png)
+
+**Detalle del lote 2:** razones de entrenamiento y de promoción, cambio de versión productiva (2 → 3), deltas frente al productivo e identificadores de MLflow.
+
+![Detalle del lote 2 en el historial de Streamlit](docs/images/frontend-historial-detalle.png)
 
 ### 8. Observabilidad y prueba de carga
 
@@ -378,3 +402,9 @@ Dashboard de Grafana, fila **Tráfico HTTP**: solicitudes totales y por segundo,
 Traza distribuida en Jaeger: comienza en el frontend y continúa en api-inference (`POST /predict`), con los spans `model.predict` e `inference_log.write`. Su identificador (`ef5c88b1…`) es el `trace_id` de una de las filas de `inference.logs` del apartado 6.
 
 ![Traza frontend → api-inference en Jaeger](docs/images/jaeger-tracing.png)
+
+### 9. Repositorio
+
+Contribuciones por integrante en GitHub (*Insights → Contributors*).
+
+![Contribuciones por integrante en GitHub](docs/images/github-contributors.png)
