@@ -2,6 +2,9 @@
 
 **Grupo 6:** Kevin Bueno · Juan Camilo Martínez · Jorge Andrés Gil
 
+**Video presentación proyecto final:**
+[![Ver el video en YouTube](https://img.youtube.com/vi/JB0RKHSxoBg/0.jpg)](https://youtu.be/JB0RKHSxoBg)
+
 Plataforma MLOps de extremo a extremo para estimar el precio de propiedades inmobiliarias. Airflow consume la API de datos del curso lote a lote (grupo 6), valida cada lote, lo guarda en RAW y CLEAN, decide con reglas explícitas si reentrena y registra el candidato en MLflow, donde solo recibe el alias `production` si supera al modelo productivo; los artefactos viven en RustFS (almacén S3), una API FastAPI sirve `models:/real_estate@production` en `POST /predict` y un frontend Streamlit lo consulta. Todo corre en Kubernetes (OrbStack) con autoescalado de la API, incluidos Prometheus, Grafana y Jaeger, que la observan; Locust (Server B) genera la carga desde otra máquina.
 
 ![Arquitectura de la plataforma](docs/images/1-arquitectura.svg)
